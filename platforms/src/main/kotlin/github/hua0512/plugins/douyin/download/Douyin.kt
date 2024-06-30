@@ -33,10 +33,8 @@ import github.hua0512.data.media.MediaInfo
 import github.hua0512.data.media.VideoFormat
 import github.hua0512.data.platform.DouyinQuality
 import github.hua0512.data.stream.StreamInfo
-import github.hua0512.data.stream.Streamer
-import github.hua0512.plugins.download.base.Download
 import github.hua0512.plugins.douyin.danmu.DouyinDanmu
-import github.hua0512.utils.withIOContext
+import github.hua0512.plugins.download.base.Download
 
 /**
  * This class represents a Douyin downloader.
@@ -44,7 +42,6 @@ import github.hua0512.utils.withIOContext
  * @property app The [App] instance.
  * @property danmu The [DouyinDanmu] instance.
  * @property streamer The [Streamer] instance.
- * @property downloadTitle The title of the downloaded video.
  * @property downloadUrl The URL of the video to be downloaded.
  */
 class Douyin(app: App, danmu: DouyinDanmu, extractor: DouyinExtractor) : Download<DouyinDownloadConfig>(app, danmu, extractor) {
@@ -61,7 +58,7 @@ class Douyin(app: App, danmu: DouyinDanmu, extractor: DouyinExtractor) : Downloa
     }
 
     val mediaInfo: MediaInfo = try {
-      withIOContext { extractor.extract() }
+      extractor.extract()
     } catch (e: Exception) {
       logger.error("Error while extracting douyin data", e)
       return false

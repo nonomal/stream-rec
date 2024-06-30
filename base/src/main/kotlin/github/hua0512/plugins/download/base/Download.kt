@@ -28,41 +28,40 @@ package github.hua0512.plugins.download.base
 
 import github.hua0512.app.App
 import github.hua0512.data.config.DownloadConfig
-import github.hua0512.data.config.DownloadConfig.DefaultDownloadConfig
+import github.hua0512.data.dto.platform.TwitchConfigDTO
 import github.hua0512.data.event.DownloadEvent
 import github.hua0512.data.media.MediaInfo
 import github.hua0512.data.media.VideoFormat
 import github.hua0512.data.stream.*
 import github.hua0512.plugins.base.Extractor
 import github.hua0512.plugins.danmu.base.Danmu
+import github.hua0512.plugins.danmu.exceptions.DownloadProcessFinishedException
+import github.hua0512.plugins.download.COMMON_HEADERS
+import github.hua0512.plugins.download.ProgressBarManager
 import github.hua0512.plugins.download.engines.BaseDownloadEngine
 import github.hua0512.plugins.download.engines.BaseDownloadEngine.Companion.PART_PREFIX
 import github.hua0512.plugins.download.engines.FFmpegDownloadEngine
 import github.hua0512.plugins.download.engines.StreamlinkDownloadEngine
 import github.hua0512.plugins.download.exceptions.DownloadFilePresentException
 import github.hua0512.plugins.download.exceptions.InsufficientDownloadSizeException
-import github.hua0512.plugins.download.exceptions.InvalidDownloadException
 import github.hua0512.plugins.event.EventCenter
 import github.hua0512.utils.*
 import io.ktor.http.*
+import io.ktor.http.auth.*
 import kotlinx.coroutines.*
 import kotlinx.datetime.Clock
 import kotlinx.datetime.Instant
-import me.tongfei.progressbar.DelegatingProgressBarConsumer
 import me.tongfei.progressbar.ProgressBar
-import me.tongfei.progressbar.ProgressBarBuilder
-import me.tongfei.progressbar.ProgressBarStyle
 import org.slf4j.Logger
 import org.slf4j.LoggerFactory
 import java.io.File
 import java.nio.file.Files
 import java.nio.file.Path
+import kotlin.coroutines.cancellation.CancellationException
 import kotlin.io.path.Path
 import kotlin.io.path.exists
 import kotlin.io.path.fileSize
 import kotlin.io.path.pathString
-import kotlin.time.DurationUnit
-import kotlin.time.toDuration
 
 abstract class Download<out T : DownloadConfig>(val app: App, open val danmu: Danmu, open val extractor: Extractor) {
 
@@ -92,14 +91,9 @@ abstract class Download<out T : DownloadConfig>(val app: App, open val danmu: Da
   protected lateinit var streamer: Streamer
 
   /**
-   * Callback triggered when the artist avatar url is updated
+   * Streamer callback
    */
-  private var artistAvatarUrlUpdateCallback: ((String) -> Unit)? = null
-
-  /**
-   * Callback triggered when the stream title is updated
-   */
-  private var streamTitleUpdateCallback: ((String) -> Unit)? = null
+  var callback: StreamerCallback? = null
 
   /**
    * The download engine used to download the stream
@@ -110,12 +104,6 @@ abstract class Download<out T : DownloadConfig>(val app: App, open val danmu: Da
    * Callback triggered when the stream is downloaded
    */
   private var onStreamDownloaded: ((StreamData) -> Unit)? = null
-
-  /**
-   * Callback triggered when the stream download fails
-   */
-  private var onStreamDownloadError: ((Exception) -> Unit)? = null
-
 
   suspend fun init(streamer: Streamer) {
     this.streamer = streamer
@@ -176,7 +164,7 @@ abstract class Download<out T : DownloadConfig>(val app: App, open val danmu: Da
       StreamingPlatform.DOUYIN -> app.config.douyinConfig.cookies
       StreamingPlatform.DOUYU -> app.config.douyuConfig.cookies
       StreamingPlatform.TWITCH -> app.config.twitchConfig.cookies
-      StreamingPlatform.PANDALIVE -> app.config.pandaliveConfig.cookies
+      StreamingPlatform.PANDATV -> app.config.pandaTvConfig.cookies
       else -> null
     }
 
@@ -184,7 +172,7 @@ abstract class Download<out T : DownloadConfig>(val app: App, open val danmu: Da
     logger.debug("(${streamer.name}) downloadUrl: $downloadUrl")
 
     // build output file path
-    var outputPath = buildOutputFilePath(downloadConfig, fileExtension)
+    val outputPath = buildOutputFilePath(downloadConfig, fileExtension)
     // check if disk space is enough
     checkDiskSpace(outputPath.parent, app.config.maxPartSize)
     // download start time
@@ -194,16 +182,159 @@ abstract class Download<out T : DownloadConfig>(val app: App, open val danmu: Da
     // progress bar
     var pb: ProgressBar? = null
 
-    val streamData: StreamData = StreamData(
+    // stream data info
+    val streamData = StreamData(
       title = downloadTitle,
-      outputFilePath = outputPath.pathString,
+      outputFilePath = "",
       danmuFilePath = null,
-      streamerId = streamer.id
-    ).also {
-      it.streamer = streamer
+      streamerId = streamer.id,
+      streamer = streamer
+    )
+
+    // download headers
+    val headers = mutableMapOf<String, String>().apply {
+      putAll(COMMON_HEADERS)
+      if (downloadConfig is TwitchConfigDTO) {
+        // add twitch headers
+        val authToken = downloadConfig.authToken ?: app.config.twitchConfig.authToken
+        put(HttpHeaders.Authorization, "${AuthScheme.OAuth} $authToken")
+      }
     }
 
-    // download engine
+    var hasError = false
+
+
+    val streamerCallback = object : DownloadCallback {
+      override fun onInit() {
+        logger.debug("(${streamer.name}) download initialized")
+        // check if the download is timed
+        val isTimed = app.config.maxPartDuration != null && app.config.maxPartDuration!! > 0
+        val max = if (isTimed) {
+          // check if maxPartSize is set
+          // bytes to kB
+          app.config.maxPartSize.takeIf { it > 0 }?.div(1024) ?: (1024 * 1024 * 1024)
+        } else {
+          app.config.maxPartSize
+        }
+
+        // build progress bar
+        pb = ProgressBarManager.addProgressBar(streamer.url, streamer.name, max)
+      }
+
+      override fun onDownloadStarted(filePath: String, time: Long) {
+        logger.debug("(${streamer.name}) download started : $filePath, time: $time")
+        // reset progressbar
+        if (pb?.current != 0L) {
+          pb?.reset()
+        }
+        val danmuPath =
+          filePath.replace(fileExtension, ContentType.Application.Xml.contentSubtype).replace(PART_PREFIX, "")
+        danmu.videoStartTime = Instant.fromEpochSeconds(time)
+
+        if (isDanmuEnabled) {
+          danmu.filePath = danmuPath
+          if (danmuJob == null) {
+            danmuJob = async {
+              val status: Boolean = withIORetry(
+                maxRetries = 5,
+                maxDelayMillis = 30000,
+                onError = { e, count -> logger.error("(${streamer.name}) danmu failed to initialize($count): $e") }) {
+                initDanmu(streamer, startTime)
+              }
+              if (!status) {
+                logger.error("(${streamer.name}) danmu failed to initialize")
+                return@async
+              } else {
+                logger.debug("(${streamer.name}) danmu :${danmu.filePath} initialized")
+              }
+              danmu.enableWrite = true
+              danmuDownload()
+            }
+          } else {
+            // re-enable danmu write
+            danmu.enableWrite = true
+          }
+        }
+        EventCenter.sendEvent(
+          DownloadEvent.DownloadStart(
+            filePath = filePath,
+            url = downloadUrl,
+            platform = streamer.platform
+          )
+        )
+      }
+
+      override fun onDownloadProgress(diff: Long, bitrate: String) {
+        pb?.let {
+          it.stepBy(diff)
+          it.extraMessage = if (bitrate.isEmpty()) "Downloading..." else "bitrate: $bitrate"
+          // extract numbers from string
+          if (bitrate.isNotEmpty()) {
+            val bitrateValue = try {
+              bitrate.substring(0, bitrate.indexOf("k")).toDouble()
+            } catch (e: Exception) {
+              0.0
+            }
+            EventCenter.sendEvent(
+              DownloadEvent.DownloadStateUpdate(
+                filePath = "",
+                url = downloadUrl,
+                platform = streamer.platform,
+                duration = it.totalElapsed.toSeconds(),
+                speed = 0.0,
+                bitrate = bitrateValue,
+                fileSize = it.current,
+                streamerId = streamer.id
+              )
+            )
+          }
+        }
+      }
+
+      override fun onDownloaded(data: FileInfo) {
+        logger.debug("({}) downloaded: {}", streamer.name, data)
+        val danmuPath = if (isDanmuEnabled) {
+          Path(danmu.filePath)
+        } else {
+          null
+        }
+
+        // check file downloaded
+        onFileDownloaded(data, streamData, danmuPath)
+      }
+
+      // normal exit
+      override fun onDownloadFinished() {
+        logger.debug("(${streamer.name}) download finished")
+      }
+
+      // error exit
+      override fun onDownloadError(filePath: String?, e: Exception) {
+        logger.error("(${streamer.name}), $filePath, download failed: $e")
+        EventCenter.sendEvent(
+          DownloadEvent.DownloadError(
+            filePath = filePath.toString(),
+            url = downloadUrl,
+            platform = streamer.platform,
+            error = e
+          )
+        )
+
+        // then it means that download has failed (no file is created)
+        logger.error("${streamer.name} download failed")
+        hasError = true
+      }
+
+      override fun onDownloadCancelled() {
+        logger.debug("(${streamer.name}) download cancelled")
+      }
+
+      override fun onDestroy() {
+        logger.debug("(${streamer.name}) download destroyed")
+      }
+
+    }
+
     engine = selectDownloadEngine().apply {
       init(
         downloadUrl,
@@ -211,191 +342,80 @@ abstract class Download<out T : DownloadConfig>(val app: App, open val danmu: Da
         outputPath.pathString,
         streamer,
         cookie,
-        Extractor.commonHeaders.toMap(),
+        headers,
         fileLimitSize = app.config.maxPartSize.run {
           if (this > 0) this else 2621440000
         },
         fileLimitDuration = app.config.maxPartDuration,
-        callback = object : DownloadCallback {
-          override fun onInit() {
-            logger.debug("(${streamer.name}) download initialized")
-            // check if the download is timed
-            val isTimed = app.config.maxPartDuration != null && app.config.maxPartDuration!! > 0
-            val max = if (isTimed) {
-              // check if maxPartSize is set
-              // bytes to kB
-              app.config.maxPartSize.takeIf { it > 0 }?.div(1024) ?: (1024 * 1024 * 1024)
-            } else {
-              app.config.maxPartSize
-            }
-
-            // build progress bar
-            pb = ProgressBarBuilder()
-              .setTaskName(streamer.name)
-              .setConsumer(DelegatingProgressBarConsumer(logger::info))
-              .setInitialMax(max)
-              .setUpdateIntervalMillis(2.toDuration(DurationUnit.MINUTES).inWholeMilliseconds.toInt())
-              .continuousUpdate()
-              .hideEta()
-              .setStyle(ProgressBarStyle.COLORFUL_UNICODE_BAR)
-              .build()
-          }
-
-          override fun onDownloadStarted(filePath: String, time: Long) {
-            logger.debug("(${streamer.name}) download started : $filePath, time: $time")
-            pb?.reset()
-            outputPath = Path(filePath)
-            val danmuPath = filePath.replace(fileExtension, ContentType.Application.Xml.contentSubtype).replace(PART_PREFIX, "")
-            danmu.videoStartTime = Instant.fromEpochSeconds(time)
-            danmu.filePath = danmuPath
-
-            if (isDanmuEnabled) {
-              if (danmuJob == null) {
-                danmuJob = async(Dispatchers.IO) {
-                  val status: Boolean = withIORetry(
-                    maxRetries = 5,
-                    maxDelayMillis = 30000,
-                    onError = { e, count -> logger.error("(${streamer.name}) danmu failed to initialize($count): $e") }) {
-                    initDanmu(streamer, startTime)
-                  }
-                  if (!status) {
-                    logger.error("(${streamer.name}) danmu failed to initialize")
-                    return@async
-                  } else {
-                    logger.debug("(${streamer.name}) danmu :${danmu.filePath} initialized")
-                  }
-                  danmu.enableWrite = true
-                  danmuDownload()
-                }
-              } else {
-                danmu.enableWrite = true
-                danmu.relaunchIO(danmuPath)
-              }
-            }
-            EventCenter.sendEvent(
-              DownloadEvent.DownloadStart(
-                filePath = filePath,
-                url = downloadUrl,
-                platform = streamer.platform
-              )
-            )
-          }
-
-          override fun onDownloadProgress(diff: Long, bitrate: String) {
-            pb?.let {
-              it.stepBy(diff)
-              it.extraMessage = if (bitrate.isEmpty()) "Downloading..." else "bitrate: $bitrate"
-              // extract numbers from string
-              if (bitrate.isNotEmpty()) {
-                val bitrateValue = try {
-                  bitrate.substring(0, bitrate.indexOf("k")).toDouble()
-                } catch (e: Exception) {
-                  0.0
-                }
-                EventCenter.sendEvent(
-                  DownloadEvent.DownloadStateUpdate(
-                    filePath = outputPath.pathString,
-                    url = downloadUrl,
-                    platform = streamer.platform,
-                    duration = it.totalElapsed.toSeconds(),
-                    speed = 0.0,
-                    bitrate = bitrateValue,
-                    fileSize = it.current,
-                    streamerId = streamer.id
-                  )
-                )
-              }
-            }
-          }
-
-          override fun onDownloaded(data: FileInfo) {
-            logger.debug("({}) downloaded: {}", streamer.name, data)
-            // check if the segment is valid
-            danmu.finish()
-            outputPath = Path(data.path)
-            val danmuPath = if (isDanmuEnabled) Path(danmu.filePath) else null
-            logger.debug("(${streamer.name}) danmu finished : ${danmu.filePath}")
-            if (processSegment(Path(data.path), danmuPath)) return
-            // update stream data
-            val stream = streamData.copy(
-              dateStart = data.createdAt,
-              dateEnd = data.updatedAt,
-              outputFilePath = data.path,
-              outputFileSize = data.size,
-              danmuFilePath = if (isDanmuEnabled) danmu.filePath else null
-            ).also {
-              it.streamer = streamer
-            }
-            EventCenter.sendEvent(
-              DownloadEvent.DownloadSuccess(
-                filePath = data.path,
-                url = downloadUrl,
-                platform = streamer.platform,
-                data = stream,
-                time = Instant.fromEpochSeconds(data.updatedAt)
-              )
-            )
-            onStreamDownloaded?.invoke(stream)
-          }
-
-          // normal exit
-          override fun onDownloadFinished() {
-            logger.debug("(${streamer.name}) download finished")
-          }
-
-          // error exit
-          override fun onDownloadError(filePath: String?, e: Exception) {
-            logger.error("(${streamer.name}), $filePath, download failed: $e")
-            outputPath = filePath?.let { Path(it) } ?: outputPath
-            EventCenter.sendEvent(
-              DownloadEvent.DownloadError(
-                filePath = outputPath.pathString,
-                url = downloadUrl,
-                platform = streamer.platform,
-                error = e
-              )
-            )
-            onStreamDownloadError?.invoke(e)
-          }
-
-          override fun onDownloadCancelled() {
-            logger.debug("(${streamer.name}) download cancelled")
-
-          }
-
-          override fun onDestroy() {
-            logger.debug("(${streamer.name}) download destroyed")
-          }
-
-        }
+        callback = streamerCallback
       )
+
+      if (this is StreamlinkDownloadEngine) {
+        // check if twitch
+        if (streamer.platform == StreamingPlatform.TWITCH) {
+          // check if skip ads is enabled
+          if (app.config.twitchConfig.skipAds) {
+            // add skip ads to streamlink args
+            programArgs.add("--twitch-disable-ads")
+          }
+        }
+      }
 
       // determine if the built-in segmenter should be used
       if (this is FFmpegDownloadEngine) {
         useSegmenter = app.config.useBuiltInSegmenter
+        detectErrors = app.config.exitDownloadOnError
       }
     }
 
-    withIOContext {
-      try {
-        engine.start()
-        // await children
-        danmuJob?.let { stopDanmuJob(it) }
-        val danmuPath = if (isDanmuEnabled) Path(danmu.filePath) else null
-        // process last segment
-        processSegment(outputPath, danmuPath)
-        logger.debug("(${streamer.name}) engine finished")
-      } catch (e: Exception) {
-        onStreamDownloadError?.invoke(e)
-        // rethrow the exception if it is an invalid download exception
-        if (e is InvalidDownloadException) {
-          throw e
+    // await engine termination
+    try {
+      engine.start()
+    } finally {
+      // process danmu
+      if (hasError) {
+        danmuJob?.let {
+          danmu.finish()
+          // stop danmu job
+          stopDanmuJob(it)
+          val file = Path(danmu.filePath)
+          // delete danmu as invalid download
+          file.deleteFile()
         }
-      } finally {
-        pb?.close()
-        engine.clean()
+      } else {
+        danmuJob?.let {
+          stopDanmuJob(it)
+        }
       }
+      danmuJob = null
+      ProgressBarManager.deleteProgressBar(streamer.url)
+      engine.clean()
     }
+  }
+
+  private fun onFileDownloaded(info: FileInfo, streamInfo: StreamData, danmuPath: Path?) {
+    // check if the segment is valid
+    danmuPath?.let { danmu.finish() }
+    logger.debug("(${streamer.name}) danmu finished : $danmuPath")
+    if (processSegment(Path(info.path), danmuPath)) return
+    // update stream data
+    val stream = streamInfo.copy(
+      dateStart = info.createdAt,
+      dateEnd = info.updatedAt,
+      outputFilePath = info.path,
+      outputFileSize = info.size,
+      danmuFilePath = danmuPath?.pathString
+    )
+    EventCenter.sendEvent(
+      DownloadEvent.DownloadSuccess(
+        filePath = info.path,
+        url = downloadUrl,
+        platform = streamer.platform,
+        data = stream,
+        time = Instant.fromEpochSeconds(info.updatedAt)
+      )
+    )
+    onStreamDownloaded?.invoke(stream)
   }
 
 
@@ -411,6 +431,7 @@ abstract class Download<out T : DownloadConfig>(val app: App, open val danmu: Da
   protected fun processSegment(segmentPath: Path, danmuPath: Path?): Boolean {
     // check if the segment is valid, a valid segment should exist and have a size greater than the minimum part size
     if (segmentPath.exists() && segmentPath.fileSize() >= app.config.minPartSize) return false
+    logger.error("(${streamer.name}) segment is invalid: ${segmentPath.pathString}")
     // cases where the segment is invalid
     deleteOutputs(segmentPath, danmuPath)
     return true
@@ -456,6 +477,8 @@ abstract class Download<out T : DownloadConfig>(val app: App, open val danmu: Da
    */
   private fun selectDownloadEngine(): BaseDownloadEngine {
     val userSelectedEngine = getDownloadEngine(app.config.engine)
+    // fallback to user selected engine if skipStreamInfo is enabled
+    if (extractor.skipStreamInfo) return userSelectedEngine
     if (!downloadUrl.contains("m3u8") && userSelectedEngine is StreamlinkDownloadEngine) {
       // fallback to ffmpeg if the stream is not HLS
       logger.warn("(${streamer.name}) stream is not HLS, fallback to ffmpeg")
@@ -524,22 +547,21 @@ abstract class Download<out T : DownloadConfig>(val app: App, open val danmu: Da
    * @param streamer the [Streamer] instance
    * @param startTime the start time of the stream
    */
-  protected suspend fun initDanmu(streamer: Streamer, startTime: Instant): Boolean = danmu.run {
-    init(streamer, startTime).also {
+  protected suspend fun initDanmu(streamer: Streamer, startTime: Instant): Boolean =
+    danmu.init(streamer, startTime).also {
       if (!it) {
         logger.error("(${streamer.name}) failed to initialize danmu")
       }
     }
-  }
 
   /**
    * Stop the danmu job
    * @param danmuJob the [Job] instance
    */
   private suspend fun stopDanmuJob(danmuJob: Job) {
-    danmu.finish()
     try {
-      danmuJob.cancelAndJoin()
+      danmuJob.cancel(CancellationException(Throwable("Cancel download", DownloadProcessFinishedException())))
+      danmuJob.join()
     } catch (e: Exception) {
       logger.error("(${streamer.name}) failed to cancel danmuJob: $e")
     } finally {
@@ -593,34 +615,16 @@ abstract class Download<out T : DownloadConfig>(val app: App, open val danmu: Da
    * @param mediaInfo the [MediaInfo] instance
    * @param streamer the [Streamer] instance
    */
-  protected fun updateStreamerInfo(mediaInfo: MediaInfo, streamer: Streamer) {
+  private fun updateStreamerInfo(mediaInfo: MediaInfo, streamer: Streamer) {
     if (mediaInfo.artistImageUrl.isNotEmpty() && mediaInfo.artistImageUrl != streamer.avatar) {
       streamer.avatar = mediaInfo.artistImageUrl
-      logger.debug("(${streamer.name}) avatar: ${streamer.avatar}")
-      artistAvatarUrlUpdateCallback?.invoke(mediaInfo.artistImageUrl)
+      callback?.onAvatarChanged(streamer, mediaInfo.artistImageUrl)
     }
     if (mediaInfo.title.isNotEmpty() && mediaInfo.title != streamer.streamTitle) {
       streamer.streamTitle = mediaInfo.title
-      logger.debug("(${streamer.name}) streamTitle: ${streamer.streamTitle}")
-      streamTitleUpdateCallback?.invoke(mediaInfo.title)
+      callback?.onDescriptionChanged(streamer, mediaInfo.title)
     }
     downloadTitle = mediaInfo.title
-  }
-
-  /**
-   * Set the artist avatar url update callback
-   * @param callback the callback function
-   */
-  fun avatarUrlUpdateCallback(callback: (String) -> Unit) {
-    this.artistAvatarUrlUpdateCallback = callback
-  }
-
-  /**
-   * Set the stream title update callback
-   * @param callback the callback function
-   */
-  fun descriptionUpdateCallback(callback: (String) -> Unit) {
-    this.streamTitleUpdateCallback = callback
   }
 
   /**
@@ -629,13 +633,5 @@ abstract class Download<out T : DownloadConfig>(val app: App, open val danmu: Da
    */
   fun onStreamDownloaded(callback: (StreamData) -> Unit) {
     this.onStreamDownloaded = callback
-  }
-
-  /**
-   * Set the stream download error callback
-   * @param callback the callback function
-   */
-  fun onStreamDownloadError(callback: (Exception) -> Unit) {
-    this.onStreamDownloadError = callback
   }
 }

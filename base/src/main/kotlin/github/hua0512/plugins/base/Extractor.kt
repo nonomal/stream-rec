@@ -29,7 +29,7 @@ package github.hua0512.plugins.base
 import github.hua0512.data.media.MediaInfo
 import github.hua0512.data.media.VideoFormat
 import github.hua0512.data.stream.StreamInfo
-import github.hua0512.utils.withIOContext
+import github.hua0512.plugins.download.COMMON_HEADERS
 import io.ktor.client.*
 import io.ktor.client.request.*
 import io.ktor.client.statement.*
@@ -52,12 +52,6 @@ abstract class Extractor(protected open val http: HttpClient, protected open val
 
 
   companion object {
-
-    val commonHeaders = arrayOf(
-      HttpHeaders.Accept to "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-      HttpHeaders.AcceptLanguage to "zh-CN,zh;q=0.8,en-US;q=0.5,en;q=0.3",
-      HttpHeaders.UserAgent to "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/108.0.3029.110 Safari/537.36"
-    )
 
     @JvmStatic
     protected val logger: Logger = LoggerFactory.getLogger(this::class.java)
@@ -111,6 +105,11 @@ abstract class Extractor(protected open val http: HttpClient, protected open val
   abstract val url: String
 
   /**
+   * Whether to skip the stream info extraction
+   */
+  var skipStreamInfo = false
+
+  /**
    * Initialize the extractor
    */
   open suspend fun prepare() {
@@ -123,9 +122,7 @@ abstract class Extractor(protected open val http: HttpClient, protected open val
    * Function to match the url with the regex pattern
    * @return a boolean value
    */
-  open fun match(): Boolean {
-    return regexPattern.matches(url)
-  }
+  protected open fun match(): Boolean = regexPattern.matches(url)
 
   /**
    * Function to check if the stream is live
@@ -144,33 +141,31 @@ abstract class Extractor(protected open val http: HttpClient, protected open val
    * get the response from the input url
    *
    * request uses predefined headers and params:
-   * [commonHeaders], [platformHeaders], [platformParams]
+   * [COMMON_HEADERS], [platformHeaders], [platformParams]
    *
    * @param url the input url
    * @param request the request builder
    * @return a [HttpResponse] object
    */
-  suspend fun getResponse(url: String, request: HttpRequestBuilder.() -> Unit = {}): HttpResponse = withIOContext {
-    http.get(url) {
-      populateCommons()
-      request()
-    }
+  suspend fun getResponse(url: String, request: HttpRequestBuilder.() -> Unit = {}): HttpResponse = http.get(url) {
+    populateCommons()
+    request()
   }
+
 
   /**
    * post the response from the input url
    * request uses predefined headers and params:
-   * [commonHeaders], [platformHeaders], [platformParams]
+   * [COMMON_HEADERS], [platformHeaders], [platformParams]
    * @param url the input url
    * @param request the request builder
    * @return a [HttpResponse] object
    */
-  suspend fun postResponse(url: String, request: HttpRequestBuilder.() -> Unit = {}): HttpResponse = withIOContext {
-    http.post(url) {
-      populateCommons()
-      request()
-    }
+  suspend fun postResponse(url: String, request: HttpRequestBuilder.() -> Unit = {}): HttpResponse = http.post(url) {
+    populateCommons()
+    request()
   }
+
 
   /**
    * populate the common headers and params
@@ -179,7 +174,7 @@ abstract class Extractor(protected open val http: HttpClient, protected open val
    */
   private fun HttpRequestBuilder.populateCommons() {
     headers {
-      commonHeaders.forEach { append(it.first, it.second) }
+      COMMON_HEADERS.forEach { append(it.first, it.second) }
       platformHeaders.forEach { append(it.key, it.value) }
       if (cookies.isNotEmpty()) {
         append(HttpHeaders.Cookie, cookies)

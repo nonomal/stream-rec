@@ -5,7 +5,7 @@ After starting the tool, you will be redirected to the login page. Enter your cr
 The default credentials are set to `stream-rec` for both the username and password. But if you set the `LOGIN_SECRET` environment variable, the
 password will be set to that value.
 
-![login.png](images/en/login.png)
+![login.png](https://github.com/hua0512/stream-rec-front/blob/master/docs/en/login.png)
 
 # 2. General settings
 
@@ -21,7 +21,7 @@ After that, you will see the general settings page. Configure the settings as ne
 > - If you want to disable parted downloads, set the `Maximum parted download duration` to a high value, e.g., `1` day.
 > - Read the comments of each setting for more information. You can also open a discussion if you have any questions.
 
-![global_settings.png](images/en/global_settings.png)
+![global_settings.png](https://github.com/hua0512/stream-rec-front/blob/master/docs/en/settings.png)
 
 # 3. Platform settings
 
@@ -31,9 +31,10 @@ Here you can configure each platform's settings, please read the comments of eac
 
 Leave it as default if you are not sure what to do.
 
-![platform_settings.png](images/en/platform_settings.png)
+![platform_settings.png](https://github.com/hua0512/stream-rec-front/blob/master/docs/en/platform_settings.png)
 
 > [!NOTE]\
+> Things to note:
 > - The update button is only attached to the platform you are currently editing. Make sure to click on the `Update settings` button after you finish
     editing each platform's settings.
 
@@ -41,7 +42,7 @@ Leave it as default if you are not sure what to do.
 
 Navigate to the streamers list page by clicking on `Streamers` (the second icon) in the left navigation bar.
 
-![streamers.png](images/en/streamers.png)
+![streamers.png](https://github.com/hua0512/stream-rec-front/blob/master/docs/en/streamers.png)
 
 Click on the `Add streamer` button to add a new streamer.
 
@@ -93,7 +94,7 @@ streamers with the same configuration.
 
 Navigate to the dashboard page by clicking on the dashboard icon in the left navigation bar.
 
-![dashboard.png](images/en/dashboard.png)
+![dashboard.png](https://github.com/hua0512/stream-rec-front/blob/master/docs/en/dashboard.png)
 
 Here you can see the status of the recordings, whether they are running or disabled. You can also see the download speed and the duration of the
 recording.

@@ -33,8 +33,9 @@ import github.hua0512.plugins.base.Extractor
 import github.hua0512.utils.decodeBase64
 import github.hua0512.utils.nonEmptyOrNull
 import github.hua0512.utils.toMD5Hex
-import github.hua0512.utils.withIOContext
 import io.ktor.client.*
+import io.ktor.client.plugins.timeout
+import io.ktor.client.request.setBody
 import io.ktor.client.statement.*
 import io.ktor.http.*
 import kotlinx.coroutines.Dispatchers
@@ -49,10 +50,11 @@ import kotlin.random.Random
  * @author hua0512
  * @date : 2024/3/15 19:46
  */
-class HuyaExtractor(override val http: HttpClient, override val json: Json, override val url: String) :
+open class HuyaExtractor(override val http: HttpClient, override val json: Json, override val url: String) :
   Extractor(http, json) {
   companion object {
     const val BASE_URL = "https://www.huya.com"
+    const val COOKIE_URL = "https://udblgn.huya.com/web/cookie/verify"
     const val URL_REGEX = "(?:https?://)?(?:(?:www|m)\\.)?huya\\.com/([a-zA-Z0-9]+)"
     const val ROOM_DATA_REGEX = "var TT_ROOM_DATA = (.*?);"
     const val AVATAR_REGEX = """avatar"\s*:\s*"([^"]+)"""
@@ -73,10 +75,11 @@ class HuyaExtractor(override val http: HttpClient, override val json: Json, over
     )
 
     internal const val PLATFORM_ID = 100
+    private const val APP_ID = 5002
   }
 
   override val regexPattern = URL_REGEX.toRegex()
-  private var roomId: String = ""
+  protected var roomId: String = ""
   private lateinit var htmlResponseBody: String
   private val ayyuidPattern = AYYUID_REGEX.toRegex()
   private val topsidPattern = TOPSID_REGEX.toRegex()
@@ -85,6 +88,9 @@ class HuyaExtractor(override val http: HttpClient, override val json: Json, over
   internal var ayyuid: Long = 0
   internal var topsid: Long = 0
   internal var subid: Long = 0
+  internal var uid = 0L
+  private var isCookieVerified = false
+  var forceOrigin = false
 
 
   init {
@@ -108,7 +114,11 @@ class HuyaExtractor(override val http: HttpClient, override val json: Json, over
   }
 
   override suspend fun isLive(): Boolean {
-    val response: HttpResponse = getResponse("$BASE_URL/$roomId")
+    val response: HttpResponse = getResponse("$BASE_URL/$roomId") {
+      timeout {
+        requestTimeoutMillis = 15000
+      }
+    }
     if (response.status != HttpStatusCode.OK) throw IllegalStateException("Invalid response status ${response.status.value} from $url")
 
     htmlResponseBody = response.bodyAsText().apply {
@@ -144,9 +154,11 @@ class HuyaExtractor(override val http: HttpClient, override val json: Json, over
   }
 
   override suspend fun extract(): MediaInfo {
+    // validate cookie
+    validateCookie()
 
     // get live status
-    val isLive = withIOContext { isLive() }
+    val isLive = isLive()
 
     // get media info from htmlResponseBody
     val avatarUrl = AVATAR_REGEX.toRegex().find(htmlResponseBody)?.groupValues?.get(1) ?: "".also {
@@ -198,22 +210,42 @@ class HuyaExtractor(override val http: HttpClient, override val json: Json, over
       else this
     } ?: throw IllegalStateException("$url gameStreamInfoList is null")
 
-    // default max bit rate
-    val maxBitRate = gameLiveInfo["bitRate"]?.jsonPrimitive?.int ?: 0
+    // default bitrate
+    val defaultBitrate = gameLiveInfo["bitRate"]?.jsonPrimitive?.int ?: 0
     // available bitrate list
     val bitrateList: List<Pair<Int, String>> = vMultiStreamInfo.jsonArray.mapIndexed { index, jsonElement ->
-      val bitrate = if (index == 0) maxBitRate else jsonElement.jsonObject["iBitRate"]?.jsonPrimitive?.int ?: 0
+      var iBitrate = jsonElement.jsonObject["iBitRate"]?.jsonPrimitive?.int ?: 0
+      // if iBitrate is 0, use default bitrate
+      if (iBitrate == 0) iBitrate = defaultBitrate
+      val bitrate = iBitrate
       val displayName = jsonElement.jsonObject["sDisplayName"]?.jsonPrimitive?.content ?: ""
       bitrate to displayName
     }
+    val streams = extractLiveStreams(gameStreamInfoList, bitrateList, defaultBitrate)
+
+    return mediaInfo.copy(streams = streams)
+  }
+
+  protected suspend fun extractLiveStreams(
+    gameStreamInfoList: JsonArray,
+    bitrateList: List<Pair<Int, String>>,
+    maxBitRate: Int,
+  ): MutableList<StreamInfo> {
     // build stream info
     val streams = mutableListOf<StreamInfo>()
     val time = Clock.System.now()
 
     withContext(Dispatchers.Default) {
       gameStreamInfoList.forEach { streamInfo ->
-        val uid = streamInfo.jsonObject["lPresenterUid"]?.jsonPrimitive?.content?.toLongOrNull()
-          ?: (12340000L..12349999L).random()
+        if (uid == 0L) {
+          // extract uid from cookies
+          // if not found, use streamer's uid
+          // if still not found, use random uid
+          uid = cookies.nonEmptyOrNull()?.let {
+            val cookie = parseClientCookiesHeader(cookies)
+            cookie["yyuid"]?.toLongOrNull() ?: cookie["udb_uid"]?.toLongOrNull()
+          } ?: streamInfo.jsonObject["lPresenterUid"]?.jsonPrimitive?.content?.toLongOrNull() ?: (12340000L..12349999L).random()
+        }
         val cdn = streamInfo.jsonObject["sCdnType"]?.jsonPrimitive?.content ?: ""
 
         val priority = streamInfo.jsonObject["iWebPriorityRate"]?.jsonPrimitive?.int ?: 0
@@ -221,6 +253,9 @@ class HuyaExtractor(override val http: HttpClient, override val json: Json, over
         arrayOf(true, false).forEach buildLoop@{ isFlv ->
           val streamUrl = buildUrl(streamInfo, uid, time, null, isFlv).nonEmptyOrNull() ?: return@buildLoop
           bitrateList.forEach { (bitrate, displayName) ->
+            // Skip HDR streams as they are not supported
+            if (displayName.contains("HDR")) return@forEach
+
             val url = if (bitrate == maxBitRate) streamUrl else "$streamUrl&ratio=$bitrate"
             streams.add(
               StreamInfo(
@@ -237,19 +272,23 @@ class HuyaExtractor(override val http: HttpClient, override val json: Json, over
         }
       }
     }
-    return mediaInfo.copy(streams = streams)
+    return streams
   }
 
-  private fun buildUrl(
+  protected fun buildUrl(
     streamInfo: JsonElement,
     uid: Long,
     time: Instant,
     bitrate: Int? = null,
-    isFlv: Boolean
+    isFlv: Boolean,
   ): String {
     val antiCode =
       streamInfo.jsonObject[if (isFlv) "sFlvAntiCode" else "sHlsAntiCode"]?.jsonPrimitive?.content ?: return ""
-    val streamName = streamInfo.jsonObject["sStreamName"]?.jsonPrimitive?.content ?: return ""
+    var streamName = streamInfo.jsonObject["sStreamName"]?.jsonPrimitive?.content ?: return ""
+
+    if (forceOrigin) {
+      streamName = streamName.replace("-imgplus", "")
+    }
     val url = streamInfo.jsonObject[if (isFlv) "sFlvUrl" else "sHlsUrl"]?.jsonPrimitive?.content ?: return ""
     val urlSuffix =
       streamInfo.jsonObject[if (isFlv) "sFlvUrlSuffix" else "sHlsUrlSuffix"]?.jsonPrimitive?.content ?: return ""
@@ -262,7 +301,7 @@ class HuyaExtractor(override val http: HttpClient, override val json: Json, over
     uid: Long,
     sStreamName: String,
     time: Instant,
-    bitrate: Int? = null
+    bitrate: Int? = null,
   ): String {
     val u = (uid shl 8 or (uid shr 24)) and -0x1
     val query = parseQueryString(anticode.removeSuffix(","))
@@ -272,7 +311,7 @@ class HuyaExtractor(override val http: HttpClient, override val json: Json, over
     val fm = query["fm"]?.decodeBase64()?.split("_")?.get(0)!!
 
     @Suppress("SpellCheckingInspection")
-    val ctype = query["ctype"]!!
+    val ctype = "tars_mp"
     val ss = "$seqId|${ctype}|$PLATFORM_ID".toByteArray().toMD5Hex()
     val wsSecret = "${fm}_${u}_${sStreamName}_${ss}_${wsTime}".toByteArray().toMD5Hex()
 
@@ -294,6 +333,61 @@ class HuyaExtractor(override val http: HttpClient, override val json: Json, over
     }
 
     return parameters.build().formUrlEncode()
+  }
+
+  /**
+   * Validate cookie if present
+   * @return true if cookie is valid, false otherwise
+   */
+  protected suspend fun validateCookie(): Boolean {
+    // check if cookie is present
+    if (cookies.isNotEmpty()) {
+      // verify cookie
+      return try {
+        verifyCookie().also {
+          isCookieVerified = it
+          if (!it) {
+            logger.warn("$url failed to verify cookie")
+          }
+        }
+      } catch (e: Exception) {
+        logger.error("Error verifying cookie", e)
+        false
+      }
+    }
+    return true
+  }
+
+
+  private suspend fun verifyCookie(): Boolean {
+    if (isCookieVerified) return true
+
+    // make verify cookie request
+    val response = postResponse(COOKIE_URL) {
+      timeout {
+        requestTimeoutMillis = 15000
+      }
+      // set json body
+      contentType(ContentType.Application.Json)
+      setBody(
+        buildJsonObject {
+          put("appId", APP_ID)
+        }
+      )
+    }
+    if (response.status != HttpStatusCode.OK) {
+      throw IllegalStateException("Invalid response status ${response.status.value} from $COOKIE_URL")
+      return false
+    }
+    val body = response.bodyAsText()
+    val json = json.parseToJsonElement(body).run {
+      if (this is JsonPrimitive) {
+        throw IllegalStateException("Invalid response body from $COOKIE_URL")
+      }
+      jsonObject
+    }
+    val returnCode = json["returnCode"]?.jsonPrimitive?.int ?: 0
+    return returnCode == 0
   }
 
 }

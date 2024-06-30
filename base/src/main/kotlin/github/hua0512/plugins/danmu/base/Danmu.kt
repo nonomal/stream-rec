@@ -24,15 +24,16 @@
  * SOFTWARE.
  */
 
+@file:OptIn(ExperimentalCoroutinesApi::class, InternalCoroutinesApi::class)
+
 package github.hua0512.plugins.danmu.base
 
 import github.hua0512.app.App
+import github.hua0512.data.media.ClientDanmuData
 import github.hua0512.data.media.DanmuDataWrapper
 import github.hua0512.data.media.DanmuDataWrapper.DanmuData
 import github.hua0512.data.stream.Streamer
 import github.hua0512.plugins.danmu.exceptions.DownloadProcessFinishedException
-import github.hua0512.utils.chunked
-import github.hua0512.utils.withIOContext
 import github.hua0512.utils.withIORetry
 import io.ktor.client.plugins.websocket.*
 import io.ktor.client.plugins.websocket.cio.*
@@ -40,16 +41,17 @@ import io.ktor.client.request.*
 import io.ktor.http.*
 import io.ktor.websocket.*
 import kotlinx.coroutines.*
-import kotlinx.coroutines.channels.BufferOverflow
-import kotlinx.coroutines.channels.Channel
-import kotlinx.coroutines.channels.Channel.Factory.BUFFERED
 import kotlinx.coroutines.flow.*
 import kotlinx.datetime.Clock
 import kotlinx.datetime.Instant
 import org.slf4j.Logger
 import org.slf4j.LoggerFactory
 import java.io.File
+import java.io.IOException
+import java.io.OutputStream
 import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.locks.ReentrantLock
+import kotlin.concurrent.withLock
 
 /**
  * Danmu (Bullet screen comments) downloader base class
@@ -62,15 +64,6 @@ import java.util.concurrent.atomic.AtomicBoolean
  * @property enablePing enable ping pong mechanism
  */
 abstract class Danmu(val app: App, val enablePing: Boolean = false) {
-
-
-  sealed class DanmuState {
-    data object NotInitialized : DanmuState()
-    data object Initialized : DanmuState()
-    data class Fetching(val path: String) : DanmuState()
-    data class Error(val error: Throwable) : DanmuState()
-    data class Closed(val reason: String) : DanmuState()
-  }
 
 
   companion object {
@@ -102,20 +95,21 @@ abstract class Danmu(val app: App, val enablePing: Boolean = false) {
   abstract val heartBeatPack: ByteArray
 
   /**
-   * Danmu state flow
-   */
-  private val _danmuState = MutableStateFlow<DanmuState>(DanmuState.NotInitialized)
-
-  /**
-   * Danmu state flow
-   */
-  val danmuState: StateFlow<DanmuState> = _danmuState.asStateFlow()
-
-
-  /**
    * Danmu file name
    */
   var filePath: String = "${Clock.System.now().toEpochMilliseconds()}.xml"
+    set(value) {
+      fos = File(value).outputStream().buffered()
+      // there is no need to check file existence
+      fos.writeStartXml()
+      logger.debug("$value wrote XML_START")
+      field = value
+    }
+
+  /**
+   * Danmu file outputstream
+   */
+  private lateinit var fos: OutputStream
 
   /**
    * Whether to enable writing danmu to file
@@ -128,16 +122,6 @@ abstract class Danmu(val app: App, val enablePing: Boolean = false) {
   var videoStartTime: Instant = Clock.System.now()
 
   /**
-   * A shared flow to write danmu data to file
-   */
-  private lateinit var writeChannel: Channel<DanmuDataWrapper>
-
-  /**
-   * IO job to write danmu to file
-   */
-  private lateinit var ioJob: Job
-
-  /**
    * Request headers
    */
   protected val headersMap = mutableMapOf<String, String>()
@@ -146,6 +130,12 @@ abstract class Danmu(val app: App, val enablePing: Boolean = false) {
    * Request parameters
    */
   protected val requestParams = mutableMapOf<String, String>()
+
+
+  /**
+   * Write lock
+   */
+  private val writeLock: ReentrantLock = ReentrantLock()
 
   /**
    * Initialize danmu
@@ -156,13 +146,9 @@ abstract class Danmu(val app: App, val enablePing: Boolean = false) {
    */
   suspend fun init(streamer: Streamer, startTime: Instant = Clock.System.now()): Boolean {
     this.videoStartTime = startTime
-    writeChannel = Channel(BUFFERED, onBufferOverflow = BufferOverflow.DROP_OLDEST)
-    _danmuState.value = DanmuState.NotInitialized
+    require(websocketUrl.isNotEmpty())
     return initDanmu(streamer, startTime).also { isEnabled ->
       isInitialized.set(isEnabled)
-      if (isEnabled) {
-        _danmuState.value = DanmuState.Initialized
-      }
     }
   }
 
@@ -179,85 +165,54 @@ abstract class Danmu(val app: App, val enablePing: Boolean = false) {
    * Fetch danmu from server using websocket
    *
    */
-  suspend fun fetchDanmu() = withIOContext {
-    supervisorScope {
-      if (!isInitialized.get()) {
-        logger.error("Danmu is not initialized")
-        return@supervisorScope
+  suspend fun fetchDanmu() = supervisorScope {
+    if (!isInitialized.get()) {
+      logger.error("danmu is not initialized")
+      return@supervisorScope
+    }
+
+    // start Websocket with backoff strategy
+    withIORetry(
+      maxRetries = 10,
+      initialDelayMillis = 10000,
+      maxDelayMillis = 60000,
+      factor = 1.5,
+      onError = { e, retryCount ->
+        logger.error("Error connecting ws, $filePath, retry count: $retryCount", e)
       }
-      if (websocketUrl.isEmpty()) return@supervisorScope
-
-      launch {
-        _danmuState.onEach {
-          when (it) {
-            is DanmuState.Error -> {
-              logger.error("Danmu error: ${it.error}")
-              // close danmu
-              _danmuState.value = DanmuState.Closed(it.error.message ?: "Error")
-            }
-
-            is DanmuState.Closed -> {
-              logger.info("Danmu closed: {}", it.reason)
-            }
-
-            is DanmuState.Fetching -> {
-              // launch a coroutine to write danmu to file
-              ioJob = this@supervisorScope.launchIOTask(it.path)
-            }
-
-            is DanmuState.Initialized -> {
-              // fetch danmu
-              this@supervisorScope.launch(Dispatchers.IO) {
-                withIORetry(
-                  maxRetries = 10,
-                  initialDelayMillis = 10000,
-                  maxDelayMillis = 60000,
-                  factor = 1.5,
-                  onError = { e, retryCount ->
-                    logger.error("Error fetching danmu: $filePath, retry count: $retryCount", e)
-                    _danmuState.value = DanmuState.Error(e)
-                  }
-                ) {
-                  _danmuState.value = DanmuState.Fetching(filePath)
-                  // determine if ping is enabled
-                  if (enablePing) {
-                    app.client.webSocket(websocketUrl, request = {
-                      fillRequest()
-                    }) {
-                      processSession()
-                    }
-                  } else {
-                    val urlBuilder = URLBuilder(websocketUrl)
-                    logger.trace("Connecting to danmu server: {}", urlBuilder)
-                    if (urlBuilder.protocol.isSecure()) {
-                      app.client.wssRaw(host = urlBuilder.host, port = urlBuilder.port, path = urlBuilder.encodedPath, request = {
-                        fillRequest()
-                      }) {
-                        processSession()
-                      }
-                    } else {
-                      app.client.wsRaw(host = urlBuilder.host, port = urlBuilder.port, request = {
-                        fillRequest()
-                      }) {
-                        processSession()
-                      }
-                    }
-                  }
-
-                }
-              }
-            }
-
-            is DanmuState.NotInitialized -> {}
+    ) {
+      logger.debug("Connecting to danmu server: $websocketUrl")
+      // determine if ping is enabled
+      if (enablePing) {
+        app.client.webSocket(websocketUrl, request = {
+          fillRequest()
+        }) {
+          processSession()
+        }
+      } else {
+        val urlBuilder = URLBuilder(websocketUrl)
+        if (urlBuilder.protocol.isSecure()) {
+          app.client.wssRaw(host = urlBuilder.host, port = urlBuilder.port, path = urlBuilder.encodedPath, request = {
+            fillRequest()
+          }) {
+            processSession()
+          }
+        } else {
+          app.client.wsRaw(host = urlBuilder.host, port = urlBuilder.port, path = urlBuilder.encodedPath, request = {
+            fillRequest()
+          }) {
+            processSession()
           }
         }
-          .catch { e ->
-            logger.error("Error handling danmu state", e)
-          }
-          .flowOn(Dispatchers.IO)
-          .collect()
+      }
+      // check if coroutine is cancelled
+      if (isActive) {
+        // trigger backoff strategy
+        throw IOException("$websocketUrl connection finished")
       }
     }
+
+    awaitCancellation()
   }
 
   private fun HttpRequestBuilder.fillRequest() {
@@ -277,72 +232,67 @@ abstract class Danmu(val app: App, val enablePing: Boolean = false) {
     sendHello(this)
     // launch a coroutine to send heart beat
     launchHeartBeatJob(this)
+    val buffer = mutableListOf<ClientDanmuData>()
+    // receive incoming
     incoming.receiveAsFlow()
-      .onEach { frame ->
+      .flatMapConcat { frame ->
         val data = frame.data
-        try {
-          // decode danmu
-          for (danmu in decodeDanmu(this, data)) {
-            when (danmu) {
-              is DanmuData -> {
-                // danmu server time
-                val serverTime = danmu.serverTime
-                // danmu process start time
-                val danmuStartTime = videoStartTime.toEpochMilliseconds()
-                // danmu in video time
-                val danmuInVideoTime = (serverTime - danmuStartTime).run {
-                  val time = if (this < 0) 0 else this
-                  String.format("%.3f", time / 1000.0).toDouble()
-                }
-                // emit danmu to write to file
-                writeChannel.trySend(danmu.copy(clientTime = danmuInVideoTime))
-              }
+        flow {
+          try {
+            // decode danmu
+            for (danmu in decodeDanmu(this@processSession, data)) {
+              when (danmu) {
+                is DanmuData -> {
+                  // calculate delta time
+                  val delta = danmu.calculateDelta()
+                  // emit danmu to write to file
+                  buffer.add(ClientDanmuData(danmu, videoStartTime, delta))
 
-              else -> logger.error("Unsupported danmu data: {}", danmu)
+                  if (buffer.size >= 20) {
+                    emit(buffer.toList())
+                    buffer.clear()
+                  }
+                }
+
+                else -> logger.error("Unsupported danmu data: {}", danmu)
+              }
             }
+          } catch (e: Exception) {
+            logger.error("Error decoding danmu", e)
           }
-        } catch (e: Exception) {
-          logger.error("Error decoding danmu", e)
         }
       }
       .flowOn(Dispatchers.Default)
-      .collect()
-  }
-
-
-  /**
-   * Launches a coroutine to perform an IO task to write danmu to file.
-   *
-   * @param filePath The path of the file to which the danmu will be written.
-   * @receiver The [CoroutineScope] on which the coroutine will be launched.
-   */
-  private fun CoroutineScope.launchIOTask(filePath: String): Job {
-    val danmuFile = File(filePath)
-
-    return writeChannel.receiveAsFlow()
-      .buffer()
-      .chunked(20)
-      .onStart {
-        logger.debug("Start writing danmu to file: {}", filePath)
-        // check if danmu file exists
-        if (!danmuFile.exists()) {
-          danmuFile.createNewFile()
-          danmuFile.appendText(XML_START)
+      .onEach {
+        val data = it.map {
+          // case when a videoStartTime update occurred
+          if (it.videoStartTime != this@Danmu.videoStartTime) {
+            it.copy(clientTime = 0.0)
+          } else it
         }
+        // discard negatives
+        fos.writeToDanmu(data)
       }
-      .onEach { data ->
-        danmuFile.writeToDanmu(data as List<DanmuData>)
-      }
-      .catch { e ->
-        if (e is DownloadProcessFinishedException) return@catch
-        logger.error("Error writing danmu to file {}", filePath, e)
+      .catch {
+        logger.error("$filePath write error: ${it.message}")
       }
       .onCompletion {
-        if (danmuFile.exists())
-          danmuFile.writeEndOfFile()
+        it ?: return@onCompletion
+        logger.error("$filePath danmu completed: $it")
+        // write end section only when download is aborted or cancelled
+        if (it.cause !is DownloadProcessFinishedException) {
+          val file = File(filePath)
+          if (file.exists()) {
+            try {
+              fos.writeEndXml()
+            } catch (e: Exception) {
+
+            }
+          }
+        }
       }
       .flowOn(Dispatchers.IO)
-      .launchIn(this)
+      .collect()
   }
 
 
@@ -357,17 +307,18 @@ abstract class Danmu(val app: App, val enablePing: Boolean = false) {
   }
 
   /**
-   * Writes the given [DanmuData] object to the danmu file.
+   * Writes the given [DanmuData] object to the given [OutputStream].
    *
-   * @param batch The list of [DanmuData] objects to be written to the danmu file.
+   * @param batch The list of [DanmuData] objects to be written to the output stream.
    */
-  private fun File.writeToDanmu(batch: List<DanmuData>) {
+  private fun OutputStream.writeToDanmu(batch: List<ClientDanmuData>) {
     if (!enableWrite) return
     val xmlContent = buildString {
       for (data in batch) {
+        val danmu = data.danmu as DanmuData
         val time = data.clientTime
-        val color = if (data.color == -1) "16777215" else data.color
-        val content = data.content.run {
+        val color = if (danmu.color == -1) "16777215" else danmu.color
+        val content = danmu.content.run {
           replace("&", "&amp;")
             .replace("<", "&lt;")
             .replace(">", "&gt;")
@@ -384,7 +335,8 @@ abstract class Danmu(val app: App, val enablePing: Boolean = false) {
         append("\n")
       }
     }
-    appendText(xmlContent)
+    write(xmlContent.toByteArray())
+    flush()
   }
 
   /**
@@ -414,20 +366,21 @@ abstract class Danmu(val app: App, val enablePing: Boolean = false) {
   protected abstract suspend fun decodeDanmu(session: WebSocketSession, data: ByteArray): List<DanmuDataWrapper?>
 
   /**
-   * Finish writting danmu to file
+   * Finish current danmu write
    */
   fun finish() {
-    enableWrite = false
-    ioJob.cancel()
-    _danmuState.value = DanmuState.Closed("Finish triggered")
-  }
-
-
-  /**
-   * Relaunch danmu write IO
-   */
-  fun relaunchIO(path: String) {
-    _danmuState.value = DanmuState.Fetching(path)
+    writeLock.withLock {
+      val exists = File(filePath).exists()
+      if (!exists) return
+      fos.flush()
+      enableWrite = false
+      fos.writeEndXml()
+      try {
+        fos.close()
+      } catch (e: Exception) {
+        // ignore
+      }
+    }
   }
 
   /**
@@ -435,15 +388,48 @@ abstract class Danmu(val app: App, val enablePing: Boolean = false) {
    */
   fun clean() {
     enableWrite = false
-    writeChannel.close()
     // reset replay cache
     headersMap.clear()
     requestParams.clear()
   }
 
-  private fun File.writeEndOfFile() {
-    appendText(XML_END)
-    logger.debug("Finish writing danmu to : $absolutePath")
+  /**
+   * Write start of XML to output stream
+   * @receiver OutputStream output stream
+   * @see [XML_START]
+   */
+  @Synchronized
+  private fun OutputStream.writeStartXml() = writeLock.withLock {
+    write(XML_START.toByteArray())
+  }
+
+
+  /**
+   * Write end of XML to output stream
+   * @receiver OutputStream output stream
+   * @see [XML_END]
+   */
+  @Synchronized
+  private fun OutputStream.writeEndXml() {
+    writeLock.withLock {
+      write(XML_END.toByteArray())
+      flush()
+      logger.debug("$filePath wrote XML_END")
+    }
+  }
+
+
+  private fun DanmuData.calculateDelta(): Double {
+    // danmu server time
+    val serverTime = serverTime
+    // danmu process start time
+    val danmuStartTime = videoStartTime.toEpochMilliseconds()
+    // danmu in video time
+    val delta = (serverTime - danmuStartTime).run {
+      val time = if (this < 0) 0 else this
+      String.format("%.3f", time / 1000.0).toDouble()
+    }
+    return delta
   }
 
 }

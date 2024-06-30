@@ -34,12 +34,14 @@ import github.hua0512.plugins.douyin.download.DouyinExtractor
 import github.hua0512.plugins.douyu.danmu.DouyuDanmu
 import github.hua0512.plugins.douyu.download.Douyu
 import github.hua0512.plugins.douyu.download.DouyuExtractor
+import github.hua0512.plugins.download.base.IPlatformDownloaderFactory
 import github.hua0512.plugins.huya.danmu.HuyaDanmu
 import github.hua0512.plugins.huya.download.Huya
 import github.hua0512.plugins.huya.download.HuyaExtractor
-import github.hua0512.plugins.pandalive.danmu.PandaliveDanmu
-import github.hua0512.plugins.pandalive.download.Pandalive
-import github.hua0512.plugins.pandalive.download.PandaliveExtractor
+import github.hua0512.plugins.huya.download.HuyaExtractorV2
+import github.hua0512.plugins.pandatv.danmu.PandaTvDanmu
+import github.hua0512.plugins.pandatv.download.PandaTv
+import github.hua0512.plugins.pandatv.download.PandaTvExtractor
 import github.hua0512.plugins.twitch.danmu.TwitchDanmu
 import github.hua0512.plugins.twitch.download.Twitch
 import github.hua0512.plugins.twitch.download.TwitchExtractor
@@ -50,14 +52,24 @@ import github.hua0512.plugins.twitch.download.TwitchExtractor
  * @author hua0512
  * @date : 2024/5/17 11:58
  */
-object PlatformDownloaderFactory {
+object PlatformDownloaderFactory : IPlatformDownloaderFactory {
 
-  fun createDownloader(app: App, platform: StreamingPlatform, url: String) = when (platform) {
-    StreamingPlatform.HUYA -> Huya(app, HuyaDanmu(app), HuyaExtractor(app.client, app.json, url))
+  override fun createDownloader(app: App, platform: StreamingPlatform, url: String) = when (platform) {
+    StreamingPlatform.HUYA -> {
+      val useMobile = app.config.huyaConfig.useMobileApi
+      val isNumericUrl = useMobile && url.split("/").last().matches(Regex("\\d+"))
+      // use v2 extractor for numeric urls
+      if (isNumericUrl) {
+        Huya(app, HuyaDanmu(app), HuyaExtractorV2(app.client, app.json, url))
+      } else {
+        Huya(app, HuyaDanmu(app), HuyaExtractor(app.client, app.json, url))
+      }
+    }
+
     StreamingPlatform.DOUYIN -> Douyin(app, DouyinDanmu(app), DouyinExtractor(app.client, app.json, url))
     StreamingPlatform.DOUYU -> Douyu(app, DouyuDanmu(app), DouyuExtractor(app.client, app.json, url))
     StreamingPlatform.TWITCH -> Twitch(app, TwitchDanmu(app), TwitchExtractor(app.client, app.json, url))
-    StreamingPlatform.PANDALIVE -> Pandalive(app, PandaliveDanmu(app), PandaliveExtractor(app.client, app.json, url))
-    else -> throw Exception("Platform not supported")
+    StreamingPlatform.PANDATV -> PandaTv(app, PandaTvDanmu(app), PandaTvExtractor(app.client, app.json, url))
+    else -> throw IllegalArgumentException("Platform not supported")
   }
 }
