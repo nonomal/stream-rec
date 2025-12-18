@@ -26,27 +26,27 @@
 
 package github.hua0512.app
 
-import app.cash.sqldelight.db.AfterVersion
-import app.cash.sqldelight.db.SqlDriver
-import app.cash.sqldelight.driver.jdbc.sqlite.JdbcSqliteDriver
-import app.cash.sqldelight.logs.LogSqliteDriver
+import androidx.room.Room
+import androidx.sqlite.driver.bundled.BundledSQLiteDriver
 import dagger.Module
 import dagger.Provides
-import github.hua0512.StreamRecDatabase
-import github.hua0512.dao.AppConfigDao
-import github.hua0512.dao.AppConfigDaoImpl
-import github.hua0512.dao.UserDao
-import github.hua0512.dao.UserDaoImpl
+import github.hua0512.dao.AppDatabase
+import github.hua0512.dao.Migrate11To12
+import github.hua0512.dao.Migrate12To13
+import github.hua0512.dao.Migrate3To4
+import github.hua0512.dao.config.AppConfigDao
+import github.hua0512.dao.config.EngineConfigDao
 import github.hua0512.dao.stats.StatsDao
-import github.hua0512.dao.stats.StatsDaoImpl
 import github.hua0512.dao.stream.StreamDataDao
-import github.hua0512.dao.stream.StreamDataDaoImpl
 import github.hua0512.dao.stream.StreamerDao
-import github.hua0512.dao.stream.StreamerDaoImpl
-import github.hua0512.dao.upload.*
-import github.hua0512.logger
+import github.hua0512.dao.upload.UploadActionDao
+import github.hua0512.dao.upload.UploadDataDao
+import github.hua0512.dao.upload.UploadResultDao
+import github.hua0512.dao.user.UserDao
 import github.hua0512.repo.LocalDataSource
-import java.util.*
+import github.hua0512.utils.mainLogger
+import kotlinx.coroutines.Dispatchers
+import kotlinx.serialization.json.Json
 import javax.inject.Singleton
 import kotlin.io.path.Path
 import kotlin.io.path.createParentDirectories
@@ -63,72 +63,51 @@ class DatabaseModule {
 
   @Provides
   @Singleton
-  fun provideSqlDriver(): SqlDriver {
+  fun provideRoomDatabase(json: Json): AppDatabase {
     val path = Path(LocalDataSource.getDefaultPath()).also {
       it.createParentDirectories()
-      logger.info("Database path: ${it.pathString}")
+      mainLogger.info("Database path: ${it.pathString}")
     }
+
     firstRun = LocalDataSource.isFirstRun()
-    return LogSqliteDriver(
-      sqlDriver = JdbcSqliteDriver("jdbc:sqlite:${path.pathString}", Properties().apply {
-        put("foreign_keys", "true")
-      }),
-      logger = { logger.trace(it) }
+
+    val builder = Room.databaseBuilder<AppDatabase>(
+      name = path.pathString
     )
+
+    return builder
+      .addMigrations(Migrate3To4, Migrate11To12, Migrate12To13(json))
+      .fallbackToDestructiveMigration(false)
+      .fallbackToDestructiveMigrationOnDowngrade(false)
+      .setDriver(BundledSQLiteDriver())
+      .setQueryCoroutineContext(Dispatchers.IO)
+      .build()
   }
 
   @Provides
-  @Singleton
-  fun provideDatabase(sqlDriver: SqlDriver): StreamRecDatabase {
-    StreamRecDatabase.Schema.create(sqlDriver)
-    val dbVersion = LocalDataSource.getDbVersion()
-    val schemaVersion = StreamRecDatabase.Schema.version
-    logger.info("Database version: $dbVersion")
-    // if not first run, check db version and migrate if needed
-    if (!firstRun) {
-      try {
-        if (dbVersion < schemaVersion) {
-          logger.info("Trying to migrate database from version $dbVersion to $schemaVersion")
-          StreamRecDatabase.Schema.migrate(sqlDriver, dbVersion, schemaVersion)
-          LocalDataSource.writeDbVersion(schemaVersion)
-        }
-      } catch (e: Exception) {
-        logger.error("Failed to migrate database", e)
-      }
-    } else {
-      // write db version
-      LocalDataSource.writeDbVersion(schemaVersion)
-      firstRun = false
-    }
-    return StreamRecDatabase(driver = sqlDriver)
-  }
+  fun provideUserDao(database: AppDatabase): UserDao = database.getUserDao()
 
   @Provides
-  fun provideUserDao(database: StreamRecDatabase): UserDao = UserDaoImpl(database)
+  fun provideAppConfigDao(database: AppDatabase): AppConfigDao = database.getConfigDao()
 
   @Provides
-  fun provideAppConfigDao(database: StreamRecDatabase): AppConfigDao = AppConfigDaoImpl(database)
+  fun provideStreamerDao(database: AppDatabase): StreamerDao = database.getStreamerDao()
 
   @Provides
-  fun provideStreamerDao(database: StreamRecDatabase): StreamerDao {
-    return StreamerDaoImpl(database)
-  }
+  fun provideStreamDataDao(database: AppDatabase): StreamDataDao = database.getStreamDataDao()
 
   @Provides
-  fun provideStreamDataDao(database: StreamRecDatabase): StreamDataDao = StreamDataDaoImpl(database)
+  fun provideUploadActionDao(database: AppDatabase): UploadActionDao = database.getUploadActionDao()
 
   @Provides
-  fun provideUploadActionDao(database: StreamRecDatabase): UploadActionDao = UploadActionDaoImpl(database)
+  fun provideUploadDataDao(database: AppDatabase): UploadDataDao = database.getUploadDataDao()
 
   @Provides
-  fun provideUploadDataDao(database: StreamRecDatabase): UploadDataDao = UploadDataDaoImpl(database)
+  fun provideUploadResultDao(database: AppDatabase): UploadResultDao = database.getUploadResultDao()
 
   @Provides
-  fun provideUploadResultDao(database: StreamRecDatabase): UploadResultDao = UploadResultDaoImpl(database)
+  fun provideStatsDao(database: AppDatabase): StatsDao = database.getStatsDao()
 
   @Provides
-  fun provideUploadActionFilesDao(database: StreamRecDatabase): UploadActionFilesDao = UploadActionFilesDaoImpl(database)
-
-  @Provides
-  fun provideStatsDao(database: StreamRecDatabase): StatsDao = StatsDaoImpl(database)
+  fun provideEngineConfigDao(database: AppDatabase): EngineConfigDao = database.getEngineConfigDao()
 }

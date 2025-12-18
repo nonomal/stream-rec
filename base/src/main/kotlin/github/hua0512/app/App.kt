@@ -28,89 +28,26 @@ package github.hua0512.app
 
 import github.hua0512.data.config.AppConfig
 import io.ktor.client.*
-import io.ktor.client.engine.cio.*
-import io.ktor.client.plugins.*
-import io.ktor.client.plugins.compression.*
-import io.ktor.client.plugins.contentnegotiation.*
-import io.ktor.client.plugins.logging.*
-import io.ktor.client.plugins.websocket.*
 import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.serialization.json.Json
-import io.ktor.serialization.kotlinx.json.*
 import org.slf4j.LoggerFactory
-import kotlin.time.DurationUnit
-import kotlin.time.toDuration
 
 
-class App(val json: Json) {
+class App(val json: Json, val client: HttpClient) {
 
   companion object {
     @JvmStatic
     val logger: org.slf4j.Logger = LoggerFactory.getLogger(App::class.java)
-
-    @JvmStatic
-    val ffmpegPath = (System.getenv("FFMPEG_PATH") ?: "ffmpeg").run {
-      // check if is windows
-      if (System.getProperty("os.name").contains("win", ignoreCase = true)) {
-        "$this.exe"
-      } else {
-        this
-      }
-    }
-
-    @JvmStatic
-    val streamLinkPath = (System.getenv("STREAMLINK_PATH") ?: "streamlink").run {
-      // check if is windows
-      if (System.getProperty("os.name").contains("win", ignoreCase = true)) {
-        "$this.exe"
-      } else {
-        this
-      }
-    }
-  }
-
-  val client by lazy {
-    HttpClient(CIO) {
-      engine {
-        pipelining = true
-      }
-      install(Logging) {
-        logger = Logger.DEFAULT
-        level = LogLevel.NONE
-      }
-      BrowserUserAgent()
-      install(HttpRequestRetry) {
-        retryOnServerErrors(maxRetries = 5)
-        exponentialDelay()
-      }
-
-      install(ContentNegotiation) {
-        json(json)
-      }
-
-      install(ContentEncoding) {
-        gzip(0.9F)
-      }
-
-//      install(HttpCookies) {
-//        storage = AcceptAllCookiesStorage()
-//      }
-
-      install(HttpTimeout) {
-        requestTimeoutMillis = 5000
-        connectTimeoutMillis = 5000
-        socketTimeoutMillis = 30.toDuration(DurationUnit.SECONDS).inWholeMilliseconds
-      }
-      install(WebSockets) {
-        pingInterval = 10_000
-      }
-    }
   }
 
   val config: AppConfig
     get() = appFlow.value ?: throw IllegalStateException("App config not initialized")
 
-  private val appFlow = MutableStateFlow<AppConfig?>(null)
+  private val _appFlow = MutableStateFlow<AppConfig?>(null)
+
+  val appFlow: StateFlow<AppConfig?> = _appFlow.asStateFlow()
 
   fun updateConfig(config: AppConfig) {
     val previous = appFlow.value
@@ -118,7 +55,7 @@ class App(val json: Json) {
     if (isChanged) {
       logger.info("App config changed : {}", config)
     }
-    this.appFlow.value = config
+    this._appFlow.value = config
   }
 
   /**

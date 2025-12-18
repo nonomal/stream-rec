@@ -3,7 +3,7 @@
  *
  * Stream-rec  https://github.com/hua0512/stream-rec
  *
- * Copyright (c) 2024 hua0512 (https://github.com/hua0512)
+ * Copyright (c) 2025 hua0512 (https://github.com/hua0512)
  *
  * Permission is hereby granted, free of charge, to any person obtaining a copy
  * of this software and associated documentation files (the "Software"), to deal
@@ -27,23 +27,20 @@
 package github.hua0512.services
 
 import github.hua0512.app.App
+import github.hua0512.data.event.Event
 import github.hua0512.data.event.UploadEvent
+import github.hua0512.data.event.UploadEvent.UploadRetriggered
 import github.hua0512.data.upload.*
-import github.hua0512.data.upload.UploadConfig.NoopConfig
-import github.hua0512.data.upload.UploadConfig.RcloneConfig
-import github.hua0512.plugins.upload.base.Upload
+import github.hua0512.plugins.event.BaseEventPlugin
 import github.hua0512.plugins.event.EventCenter
 import github.hua0512.plugins.upload.NoopUploader
-import github.hua0512.plugins.upload.RcloneUploader
-import github.hua0512.plugins.upload.UploadFailedException
-import github.hua0512.plugins.upload.UploadInvalidArgumentsException
-import github.hua0512.repo.uploads.UploadRepo
+import github.hua0512.plugins.upload.base.Upload
+import github.hua0512.plugins.upload.exceptions.UploadFailedException
+import github.hua0512.plugins.upload.exceptions.UploadInvalidArgumentsException
+import github.hua0512.repo.upload.UploadRepo
 import github.hua0512.utils.withIOContext
-import kotlinx.coroutines.*
-import kotlinx.coroutines.flow.*
 import kotlinx.coroutines.sync.Semaphore
 import kotlinx.coroutines.sync.withPermit
-import kotlinx.datetime.Clock
 import org.slf4j.Logger
 import org.slf4j.LoggerFactory
 
@@ -52,7 +49,6 @@ import org.slf4j.LoggerFactory
  * Service class for managing upload actions.
  *
  * This class provides methods for running the upload service, uploading an upload action, and providing an uploader based on the upload configuration.
- * It also contains a flow of upload actions and a map to keep track of failed uploads and the number of times they failed (in-memory).
  *
  * @property app The application instance.
  * @property uploadRepo The repository for managing upload actions.
@@ -60,7 +56,7 @@ import org.slf4j.LoggerFactory
  * @author hua0512
  * @date : 2024/2/19 15:30
  */
-class UploadService(val app: App, private val uploadRepo: UploadRepo) {
+class UploadService(val app: App, private val uploadRepo: UploadRepo) : BaseEventPlugin() {
 
   companion object {
     /**
@@ -68,12 +64,32 @@ class UploadService(val app: App, private val uploadRepo: UploadRepo) {
      */
     @JvmStatic
     private val logger: Logger = LoggerFactory.getLogger(UploadService::class.java)
+
+    // Constants for upload configuration
+    private const val MAX_RETRY_ATTEMPTS = 3
   }
 
   /**
-   * A semaphore to limit the number of concurrent uploads.
+   * A semaphore to limit the number of concurrent upload.
    */
   private val uploadSemaphore: Semaphore by lazy { Semaphore(app.config.maxConcurrentUploads) }
+
+
+  init {
+    EventCenter.subscribe(UploadRetriggered::class, this)
+  }
+
+  override suspend fun onEvent(event: Event) {
+    event as UploadRetriggered
+    event.uploadData.uploadAction?.let { action ->
+      PlatformUploaderFactory.create(app, action.uploadConfig).takeIf { it !is NoopUploader }?.let { uploader ->
+        parallelUpload(listOf(event.uploadData), uploader)
+      }
+    } ?: logger.error("Upload action not found for upload data: ${event.uploadData.id}")
+  }
+
+  override fun cleanUp() {
+  }
 
   /**
    * Uploads an upload action.
@@ -81,27 +97,17 @@ class UploadService(val app: App, private val uploadRepo: UploadRepo) {
    *
    * @param uploadAction The upload action to upload.
    */
-  @OptIn(ExperimentalCoroutinesApi::class)
-  suspend fun upload(uploadAction: UploadAction) {
-    val saved = withIOContext {
-      uploadRepo.saveAction(uploadAction)
-    }
-    uploadAction.id = saved.value
-    val uploader = provideUploader(uploadAction.uploadConfig)
-    if (uploader is NoopUploader) {
-      return
-    }
-    val deferredResults = CompletableDeferred<List<UploadResult>>()
-    withIOContext {
-      val results = parallelUpload(uploadAction.files, uploader)
-      logger.debug("Upload results: {}", results)
-      deferredResults.complete(results)
-    }
+  suspend fun upload(uploadAction: UploadAction) = withIOContext {
+    val saved = uploadRepo.saveAction(uploadAction)
 
-    deferredResults.await()
-    // throw exception with exception message of the first failed upload
-    deferredResults.getCompleted().firstOrNull { !it.isSuccess }?.let {
-      throw UploadFailedException(it.message, it.filePath)
+    PlatformUploaderFactory.create(app, uploadAction.uploadConfig).takeIf { it !is NoopUploader }?.let { uploader ->
+      val results = parallelUpload(saved.files, uploader)
+      logger.debug("Upload results: {}", results)
+
+      // Throw exception for first failure if any
+      results.firstOrNull { !it.isSuccess }?.let {
+        throw UploadFailedException(it.message ?: "", it.filePath.toString())
+      }
     }
   }
 
@@ -109,23 +115,17 @@ class UploadService(val app: App, private val uploadRepo: UploadRepo) {
   /**
    * Uploads a collection of files in parallel.
    * This function uses the provided plugin to upload each file in the collection.
-   * The number of concurrent uploads is determined by the application's configuration.
    *
    * @param files The collection of files to upload.
    * @param plugin The plugin to use for uploading the files.
    * @return A list of upload results.
    */
-  @OptIn(ExperimentalCoroutinesApi::class)
-  private suspend fun parallelUpload(files: Collection<UploadData>, plugin: Upload): List<UploadResult> = coroutineScope {
-    files.asFlow()
-      .flatMapMerge(concurrency = app.config.maxConcurrentUploads) { file ->
-        uploadFileFlow(file, plugin)
-      }
-      .onEach {
-        uploadRepo.saveResult(it)
-      }
-      .flowOn(Dispatchers.IO)
-      .toList()
+  private suspend fun <T : UploadConfig> parallelUpload(
+    files: Collection<UploadData>,
+    plugin: Upload<T>,
+  ): List<UploadResult> = withIOContext {
+    files.map { uploadFile(it, plugin) }
+      .onEach { uploadRepo.saveResult(it) }
   }
 
   /**
@@ -134,87 +134,93 @@ class UploadService(val app: App, private val uploadRepo: UploadRepo) {
    *
    * @param file The file to upload.
    * @param plugin The plugin to use for uploading the file.
-   * @return A flow of upload results.
+   * @return An upload result
    */
-  private fun uploadFileFlow(file: UploadData, plugin: Upload): Flow<UploadResult> = flow {
-    var attempts = 0
-    // change the status to UPLOADING
-    file.status = UploadState.UPLOADING
-    uploadRepo.changeUploadDataStatus(file.id, file.status)
-    EventCenter.sendEvent(UploadEvent.UploadStart(file.filePath, file.uploadPlatform, Clock.System.now()))
-    // Retry logic
-    while (attempts < 3) {
-      try {
-        if (attempts > 0 && file.status != UploadState.REUPLOADING) {
-          // change the status to REUPLOADING if the upload is being retried
-          file.status = UploadState.REUPLOADING
-          uploadRepo.changeUploadDataStatus(file.id, file.status)
-          EventCenter.sendEvent(UploadEvent.UploadRetry(file.filePath, file.uploadPlatform, Clock.System.now(), attempts))
-        } else if (attempts > 0 && file.status == UploadState.REUPLOADING) {
-          EventCenter.sendEvent(UploadEvent.UploadRetry(file.filePath, file.uploadPlatform, Clock.System.now(), attempts))
-        }
+  private suspend fun <T : UploadConfig> uploadFile(file: UploadData, plugin: Upload<T>): UploadResult =
+    uploadSemaphore.withPermit {
+      var currentFile = file.copy(status = UploadState.UPLOADING).also {
+        uploadRepo.updateUploadData(it)
+        notifyUploadStart(it)
+      }
 
-        // upload the file
-        uploadSemaphore.withPermit {
-          val status = plugin.upload(file).apply {
-            uploadData = file
+      for (attempt in 1..MAX_RETRY_ATTEMPTS) {
+        try {
+          handleRetryAttempt(attempt, currentFile)
+
+          // Perform upload
+          return plugin.upload(currentFile).also {
+            updateUploadSuccess(currentFile)
+            logger.info("Successfully uploaded file: ${currentFile.filePath}")
           }
-          file.status = UploadState.UPLOADED
-          file.uploadResults.add(status)
-          uploadRepo.changeUploadDataStatus(file.id, file.status)
-          EventCenter.sendEvent(UploadEvent.UploadSuccess(file.filePath, file.uploadPlatform, Clock.System.now()))
-          logger.info("Successfully uploaded file: ${file.filePath}")
-          emit(status)
-          attempts = 3
-        }
-      } catch (e: UploadInvalidArgumentsException) {
-        logger.error("Invalid arguments for upload: ${file.filePath}")
-        EventCenter.sendEvent(UploadEvent.UploadFailure(file.filePath, file.uploadPlatform, Clock.System.now(), e))
-        emit(
-          UploadResult(
-            startTime = Clock.System.now().epochSeconds, isSuccess = false, message = "Invalid arguments for upload: ${e.message}",
-          ).apply {
-            uploadData = file
-            file.status = UploadState.FAILED
-            file.uploadResults.add(this)
-            uploadRepo.changeUploadDataStatus(file.id, file.status)
+        } catch (e: UploadInvalidArgumentsException) {
+          logger.error("Invalid arguments for upload file: ${currentFile.filePath}")
+          return handleUploadError(currentFile, e)
+        } catch (e: Exception) {
+          logger.error("Failed to upload file: ${currentFile.filePath}, attempt: $attempt", e)
+          currentFile = handleUploadFailure(currentFile, e)
+
+          // If this was the last attempt, return error result
+          if (attempt == MAX_RETRY_ATTEMPTS) {
+            return handleUploadError(currentFile, e)
           }
-        )
-        attempts = 3
-      } catch (e: Exception) {
-        // other exceptions,
-        // most likely network issues or an UploadFailedException
-        attempts++
-        logger.error("Failed to upload file: ${file.filePath}, attempt: $attempts", e)
-        EventCenter.sendEvent(UploadEvent.UploadFailure(file.filePath, file.uploadPlatform, Clock.System.now(), e))
-        if (attempts >= 3) {
-          emit(
-            UploadResult(
-              startTime = Clock.System.now().epochSeconds,
-              isSuccess = false,
-              message = "Failed to upload file : $e",
-            ).apply {
-              uploadData = file
-              file.status = UploadState.FAILED
-              file.uploadResults.add(this)
-              uploadRepo.changeUploadDataStatus(file.id, file.status)
-            })
         }
       }
+
+      throw UploadFailedException("Failed to upload file: ${currentFile.filePath}", currentFile.filePath)
+    }
+
+  private suspend fun handleRetryAttempt(attempt: Int, file: UploadData) {
+    if (attempt > 1) {
+      if (file.status != UploadState.REUPLOADING) {
+        file.copy(status = UploadState.REUPLOADING).also {
+          uploadRepo.updateUploadData(it)
+        }
+      }
+      notifyUploadRetry(file, attempt)
     }
   }
 
-  /**
-   * Provides an uploader based on the upload configuration.
-   * This function returns an uploader based on the type of the upload configuration.
-   *
-   * @param config The upload configuration.
-   * @return An uploader.
-   * @throws IllegalArgumentException If the upload configuration is invalid.
-   */
-  private fun provideUploader(config: UploadConfig) = when (config) {
-    is RcloneConfig -> RcloneUploader(app, config)
-    is NoopConfig -> NoopUploader(app)
-    else -> throw IllegalArgumentException("Invalid config: $config")
+  private suspend fun updateUploadSuccess(file: UploadData) {
+    uploadRepo.updateUploadData(file.copy(status = UploadState.UPLOADED))
+    EventCenter.sendEvent(UploadEvent.UploadSuccess(file.filePath, file.uploadPlatform, kotlin.time.Clock.System.now()))
+  }
+
+  private suspend fun handleUploadFailure(file: UploadData, error: Exception): UploadData {
+    EventCenter.sendEvent(
+      UploadEvent.UploadFailure(
+        file.filePath,
+        file.uploadPlatform,
+        kotlin.time.Clock.System.now(),
+        error
+      )
+    )
+    return file.copy(status = UploadState.FAILED).also {
+      uploadRepo.updateUploadData(it)
+    }
+  }
+
+  private fun handleUploadError(file: UploadData, error: Exception): UploadResult {
+    return UploadResult(
+      startTime = kotlin.time.Clock.System.now().epochSeconds,
+      isSuccess = false,
+      message = error.message ?: "Unknown error",
+      uploadDataId = file.id,
+      uploadData = file
+    )
+  }
+
+  private suspend fun notifyUploadStart(file: UploadData) {
+    EventCenter.sendEvent(UploadEvent.UploadStart(file.filePath, file.uploadPlatform, kotlin.time.Clock.System.now()))
+  }
+
+  private suspend fun notifyUploadRetry(file: UploadData, attempt: Int) {
+    EventCenter.sendEvent(
+      UploadEvent.UploadRetry(
+        file.filePath,
+        file.uploadPlatform,
+        kotlin.time.Clock.System.now(),
+        attempt
+      )
+    )
   }
 }

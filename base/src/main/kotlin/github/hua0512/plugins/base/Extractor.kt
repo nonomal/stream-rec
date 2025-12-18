@@ -3,7 +3,7 @@
  *
  * Stream-rec  https://github.com/hua0512/stream-rec
  *
- * Copyright (c) 2024 hua0512 (https://github.com/hua0512)
+ * Copyright (c) 2025 hua0512 (https://github.com/hua0512)
  *
  * Permission is hereby granted, free of charge, to any person obtaining a copy
  * of this software and associated documentation files (the "Software"), to deal
@@ -26,17 +26,26 @@
 
 package github.hua0512.plugins.base
 
+import com.github.michaelbull.result.*
+import com.github.michaelbull.result.annotation.UnsafeResultValueAccess
+import github.hua0512.app.COMMON_HEADERS
 import github.hua0512.data.media.MediaInfo
 import github.hua0512.data.media.VideoFormat
 import github.hua0512.data.stream.StreamInfo
-import github.hua0512.utils.withIOContext
+import github.hua0512.utils.mapError
 import io.ktor.client.*
 import io.ktor.client.request.*
 import io.ktor.client.statement.*
 import io.ktor.http.*
+import io.lindstrom.m3u8.model.MultivariantPlaylist
+import io.lindstrom.m3u8.parser.MediaPlaylistParser
+import io.lindstrom.m3u8.parser.MultivariantPlaylistParser
+import io.lindstrom.m3u8.parser.ParsingMode
 import kotlinx.serialization.json.Json
 import org.slf4j.Logger
 import org.slf4j.LoggerFactory
+import kotlin.jvm.optionals.getOrElse
+import kotlin.jvm.optionals.getOrNull
 
 /**
  * The base class for all the extractors.
@@ -53,12 +62,6 @@ abstract class Extractor(protected open val http: HttpClient, protected open val
 
   companion object {
 
-    val commonHeaders = arrayOf(
-      HttpHeaders.Accept to "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-      HttpHeaders.AcceptLanguage to "zh-CN,zh;q=0.8,en-US;q=0.5,en;q=0.3",
-      HttpHeaders.UserAgent to "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/108.0.3029.110 Safari/537.36"
-    )
-
     @JvmStatic
     protected val logger: Logger = LoggerFactory.getLogger(this::class.java)
 
@@ -71,11 +74,6 @@ abstract class Extractor(protected open val http: HttpClient, protected open val
     protected fun parseCookies(cookies: String): Map<String, String> {
       return parseClientCookiesHeader(cookies)
     }
-
-    private val bandwidthPattern = Regex("BANDWIDTH=(\\d+)")
-    private val resolutionPattern = Regex("RESOLUTION=(\\d+x\\d+)")
-    private val videoPattern = Regex("VIDEO=\"([^\"]+)\"")
-    private val frameRatePattern = Regex("FRAME-RATE=(\\d+)")
 
   }
 
@@ -111,66 +109,110 @@ abstract class Extractor(protected open val http: HttpClient, protected open val
   abstract val url: String
 
   /**
-   * Initialize the extractor
+   * Whether to skip the stream info extraction
    */
-  open suspend fun prepare() {
-    if (!match()) {
-      throw IllegalArgumentException("The url $url does not match the pattern")
+  var skipStreamInfo = false
+
+  /**
+   * Initialize the extractor
+   * @return a [Result] object with the value of the url, or an error
+   * @see Result
+   */
+  open fun prepare(): Result<String, ExtractorError> {
+    val matchResult = match()
+
+    if (matchResult.isErr) {
+      return Err(ExtractorError.InvalidExtractionUrl)
     }
+    return Ok(matchResult.get()!!)
   }
 
   /**
    * Function to match the url with the regex pattern
-   * @return a boolean value
+   * @return a [Result] object with the value of the url, or an error if the url does not match the pattern
    */
-  open fun match(): Boolean {
-    return regexPattern.matches(url)
+  open fun match(): Result<String, ExtractorError> = if (regexPattern.matches(url)) {
+    Ok(url)
+  } else {
+    Err(ExtractorError.InvalidExtractionUrl)
   }
+
+
+  /**
+   * Function to get the platform specific headers
+   * @return a map of platform headers
+   */
+  open fun getRequestHeaders(): Map<String, String> = platformHeaders.toMap()
+
 
   /**
    * Function to check if the stream is live
    * @return a boolean value
    */
-  protected abstract suspend fun isLive(): Boolean
+  protected abstract suspend fun isLive(): Result<Boolean, ExtractorError>
 
   /**
    * Function to extract the media info from the stream
    * @return a [MediaInfo] object
    * @see MediaInfo
    */
-  abstract suspend fun extract(): MediaInfo
+  abstract suspend fun extract(): Result<MediaInfo, ExtractorError>
+
+  /**
+   * Function to get the true URL of the stream
+   *
+   * Mainly used for the platforms that require additional requests to get the true URL after the initial extraction
+   * @param streamInfo the stream info
+   * @return a [StreamInfo] object if successful, or an error
+   * @see StreamInfo [Result]
+   */
+  open suspend fun getTrueUrl(streamInfo: StreamInfo): Result<StreamInfo, ExtractorError> {
+    return Ok(streamInfo)
+  }
+
+
+  open fun onRepeatedError(error: ExtractorError, retries: Int) {
+    logger.error("$url error: $error, retries: $retries")
+  }
 
   /**
    * get the response from the input url
    *
    * request uses predefined headers and params:
-   * [commonHeaders], [platformHeaders], [platformParams]
+   * [COMMON_HEADERS], [platformHeaders], [platformParams]
    *
    * @param url the input url
    * @param request the request builder
-   * @return a [HttpResponse] object
+   * @return Result of the response
    */
-  suspend fun getResponse(url: String, request: HttpRequestBuilder.() -> Unit = {}): HttpResponse = withIOContext {
+  suspend fun getResponse(
+    url: String,
+    request: HttpRequestBuilder.() -> Unit = {},
+  ): Result<HttpResponse, ExtractorError.ApiError> = runCatching {
     http.get(url) {
       populateCommons()
       request()
     }
-  }
+  }.mapError()
 
   /**
    * post the response from the input url
    * request uses predefined headers and params:
-   * [commonHeaders], [platformHeaders], [platformParams]
+   * [COMMON_HEADERS], [platformHeaders], [platformParams]
    * @param url the input url
    * @param request the request builder
-   * @return a [HttpResponse] object
+   * @return Result of the response
    */
-  suspend fun postResponse(url: String, request: HttpRequestBuilder.() -> Unit = {}): HttpResponse = withIOContext {
+  suspend fun postResponse(
+    url: String,
+    request: HttpRequestBuilder.() -> Unit = {},
+  ): Result<HttpResponse, ExtractorError.ApiError> = runCatching {
     http.post(url) {
       populateCommons()
       request()
     }
-  }
+  }.mapError()
+
 
   /**
    * populate the common headers and params
@@ -179,7 +221,7 @@ abstract class Extractor(protected open val http: HttpClient, protected open val
    */
   private fun HttpRequestBuilder.populateCommons() {
     headers {
-      commonHeaders.forEach { append(it.first, it.second) }
+      COMMON_HEADERS.forEach { append(it.first, it.second) }
       platformHeaders.forEach { append(it.key, it.value) }
       if (cookies.isNotEmpty()) {
         append(HttpHeaders.Cookie, cookies)
@@ -190,24 +232,53 @@ abstract class Extractor(protected open val http: HttpClient, protected open val
     }
   }
 
+  private fun isMasterPlaylist(content: String) = content.contains("#EXT-X-STREAM-INF")
+
+
   /**
    * Parses a hls playlist response and returns a list of [StreamInfo]
-   * @param response the input response
+   * @param playlistString the input m3u8 playlist string
    * @return a list of [StreamInfo]
    */
-  protected suspend fun parseHlsPlaylist(response: HttpResponse): List<StreamInfo> {
-    val body = response.bodyAsText()
+  protected fun parseHlsPlaylist(playlistString: String): Result<List<StreamInfo>, ExtractorError> {
     val streams = mutableListOf<StreamInfo>()
-    val lines = body.lines()
-    lines.indices.filter { lines[it].startsWith("#EXT-X-STREAM-INF") }.forEach { index ->
-      val line = lines[index]
-      val bandwidth = bandwidthPattern.find(line)?.groupValues?.get(1)?.toLong() ?: 0
-      val resolution = resolutionPattern.find(line)?.groupValues?.get(1)?.let { mapOf("resolution" to it) } ?: emptyMap()
-      val video = videoPattern.find(line)?.groupValues?.get(1)!!
-      val frameRate = frameRatePattern.find(line)?.groupValues?.get(1)?.toDouble() ?: 0.0
-      val url = lines[index + 1]
-      streams.add(StreamInfo(url, VideoFormat.hls, video, bandwidth, frameRate = frameRate, extras = resolution))
+    val parsingMode = ParsingMode.LENIENT
+    val mediaParser = if (isMasterPlaylist(playlistString)) {
+      MultivariantPlaylistParser(parsingMode)
+    } else {
+      MediaPlaylistParser(parsingMode)
     }
-    return streams.toList()
+
+    return runCatching {
+      mediaParser.readPlaylist(playlistString)
+    }.mapError {
+      ExtractorError.InvalidResponse("Failed to parse playlist")
+    }.andThen { playlist ->
+      if (playlist is MultivariantPlaylist) {
+        val variants = playlist.variants()
+        val variantStreams = variants.map { variant ->
+          val extraMap = variant.resolution().getOrNull()?.let { mapOf("resolution" to "${it.width()}x${it.height()}") }
+            ?: emptyMap()
+          StreamInfo(
+            variant.uri(),
+            format = VideoFormat.hls,
+            variant.video().map {
+              if (it == "chunked")
+                "source"
+              else
+                it
+            }.getOrElse { "" },
+            variant.bandwidth(),
+            0,
+            variant.frameRate().getOrElse { 0.0 },
+            extras = extraMap
+          )
+        }
+        streams.addAll(variantStreams)
+        Ok(streams.toList())
+      } else {
+        Err(ExtractorError.InvalidResponse("Media playlist returned instead of master playlist"))
+      }
+    }
   }
 }

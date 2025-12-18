@@ -3,7 +3,7 @@
  *
  * Stream-rec  https://github.com/hua0512/stream-rec
  *
- * Copyright (c) 2024 hua0512 (https://github.com/hua0512)
+ * Copyright (c) 2025 hua0512 (https://github.com/hua0512)
  *
  * Permission is hereby granted, free of charge, to any person obtaining a copy
  * of this software and associated documentation files (the "Software"), to deal
@@ -37,15 +37,11 @@ import github.hua0512.utils.*
 import github.hua0512.utils.process.InputSource
 import github.hua0512.utils.process.Redirect
 import kotlinx.coroutines.async
-import kotlinx.datetime.Clock
-import kotlinx.datetime.Instant
+import kotlin.time.Instant
 import org.slf4j.Logger
 import org.slf4j.LoggerFactory
 import java.io.File
-import kotlin.io.path.Path
-import kotlin.io.path.createParentDirectories
-import kotlin.io.path.moveTo
-import kotlin.io.path.name
+import kotlin.io.path.*
 
 /**
  * ActionService is responsible for running actions on the stream data
@@ -63,10 +59,10 @@ class ActionService(private val app: App, private val uploadService: UploadServi
     actions.filter {
       it.enabled
     }.forEach { action ->
-      val job = async {
-        action.mapToAction(streamDataList)
-      }
       try {
+        val job = async {
+          action.mapToAction(streamDataList)
+        }
         job.await()
       } catch (e: Exception) {
         logger.error("$streamDataList, error while executing action $action : ${e.message}")
@@ -80,16 +76,14 @@ class ActionService(private val app: App, private val uploadService: UploadServi
     val dataList = streamDataList.flatMap { streamData ->
       listOfNotNull(
         UploadData(
-          filePath = streamData.outputFilePath
-        ).also {
-          it.streamData = streamData
-        },
+          filePath = streamData.outputFilePath,
+          streamData = streamData,
+        ),
         streamData.danmuFilePath?.let { danmu ->
           UploadData(
-            filePath = danmu
-          ).also {
-            it.streamData = streamData
-          }
+            filePath = danmu,
+            streamData = streamData
+          )
         }
       )
     }
@@ -101,8 +95,8 @@ class ActionService(private val app: App, private val uploadService: UploadServi
     when (this) {
       is RcloneAction -> {
         UploadAction(
-          time = Clock.System.now().toEpochMilliseconds(),
-          files = dataList.toSet(),
+          time = kotlin.time.Clock.System.now().toEpochMilliseconds(),
+          files = dataList,
           uploadConfig = UploadConfig.RcloneConfig(
             rcloneOperation = this.rcloneOperation,
             remotePath = this.remotePath,
@@ -116,17 +110,22 @@ class ActionService(private val app: App, private val uploadService: UploadServi
           logger.info("Running command action : $this")
 
           val streamData = streamDataList.first()
-          val streamer = streamData.streamer
+          val streamer = streamData.streamer ?: throw IllegalStateException("Streamer not found for stream data $streamData")
           val downloadConfig = streamer.templateStreamer?.downloadConfig ?: streamer.downloadConfig
           val downloadOutputFolder: File? = (downloadConfig?.outputFolder?.nonEmptyOrNull() ?: app.config.outputFolder).let {
             val instant = Instant.fromEpochSeconds(streamData.dateStart!!)
-            val path = it.replacePlaceholders(streamer.name, streamData.title, instant)
-            Path(path).toFile().also { file ->
-              // if the folder does not exist, then it should be an error
-              if (!file.exists()) {
-                logger.error("Output folder $this does not exist")
+            val path = it.replacePlaceholders(streamer.name, streamData.title, streamer.platform.name, instant)
+            Path(path).let { path ->
+              if (!path.exists()) {
+                logger.error("Output folder $path does not exist")
                 return@let null
               }
+
+              if (!path.isDirectory()) {
+                logger.error("Output folder $path is not a directory")
+                return@let null
+              }
+              path.toFile()
             }
           }
           // files + danmu files
@@ -170,7 +169,18 @@ class ActionService(private val app: App, private val uploadService: UploadServi
         }
       }
 
-      else -> throw UnsupportedOperationException("Invalid action: $this")
+      is CopyAction -> {
+        dataList.forEach {
+          val file = Path(it.filePath)
+          val dest = Path(this.destination)
+          val destFile = dest.resolve(file.name).apply {
+            createParentDirectories()
+          }
+          file.copyTo(destFile)
+          logger.info("Copied $file to $destFile")
+        }
+      }
+
     }
   }
 

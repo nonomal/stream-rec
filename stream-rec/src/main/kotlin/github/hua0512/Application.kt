@@ -3,7 +3,7 @@
  *
  * Stream-rec  https://github.com/hua0512/stream-rec
  *
- * Copyright (c) 2024 hua0512 (https://github.com/hua0512)
+ * Copyright (c) 2025 hua0512 (https://github.com/hua0512)
  *
  * Permission is hereby granted, free of charge, to any person obtaining a copy
  * of this software and associated documentation files (the "Software"), to deal
@@ -26,7 +26,6 @@
 
 package github.hua0512
 
-import app.cash.sqldelight.db.SqlDriver
 import ch.qos.logback.classic.Level
 import ch.qos.logback.classic.LoggerContext
 import ch.qos.logback.classic.encoder.PatternLayoutEncoder
@@ -40,103 +39,140 @@ import ch.qos.logback.core.util.FileSize
 import github.hua0512.app.App
 import github.hua0512.app.AppComponent
 import github.hua0512.app.DaggerAppComponent
+import github.hua0512.backend.ServerConfig
 import github.hua0512.backend.backendServer
 import github.hua0512.data.config.AppConfig
 import github.hua0512.plugins.event.EventCenter
 import github.hua0512.repo.AppConfigRepo
 import github.hua0512.repo.LocalDataSource
+import github.hua0512.utils.mainLogger
+import github.hua0512.utils.nonEmptyOrNull
+import github.hua0512.utils.withIOContext
+import io.ktor.server.engine.*
 import io.ktor.server.netty.*
 import kotlinx.coroutines.*
+import kotlinx.coroutines.flow.flowOn
 import org.slf4j.Logger
 import org.slf4j.LoggerFactory
-import java.io.IOException
+import kotlin.coroutines.coroutineContext
 import kotlin.io.path.Path
 import kotlin.io.path.pathString
 
 
 class Application {
   companion object {
+
     init {
       initLogger()
     }
 
+    /**
+     * Backend server instance
+     */
+    private var server: EmbeddedServer<ApplicationEngine, NettyApplicationEngine.Configuration>? = null
+
     @JvmStatic
-    fun main(args: Array<String>): Unit = runBlocking {
-      var server: NettyApplicationEngine? = null
-      val appComponent: AppComponent = DaggerAppComponent.create()
-      val app = appComponent.getAppConfig()
-      try {
+    fun main(args: Array<String>): Unit {
+
+      // enable coroutine debug mode
+      System.setProperty(DEBUG_PROPERTY_NAME, DEBUG_PROPERTY_VALUE_ON)
+
+      runBlocking(CoroutineName("main")) {
+        val appComponent: AppComponent = DaggerAppComponent.create()
+
+        val app = appComponent.getAppConfig()
+
+        val jobScope = initComponents(appComponent, app)
+
         // start the app
         // add shutdown hook
         Runtime.getRuntime().addShutdownHook(Thread {
-          logger.info("Stream-rec shutting down...")
+          mainLogger.info("Stream-rec shutting down...")
           server?.stop(1000, 1000)
-          appComponent.getSqlDriver().closeDriver()
+          Thread.sleep(1000)
+          jobScope.cancel()
           app.releaseAll()
+          appComponent.getDatabase().close()
           EventCenter.stop()
-          cancel()
+          server = null
         })
-        initComponents(appComponent, app, initializeServer = { server = it })
-        awaitCancellation()
-      } finally {
-        logger.info("Stream-rec is stopped")
+        // wait for the job to finish
+        jobScope.coroutineContext[Job]?.join()
       }
     }
 
-    private suspend fun initComponents(
+    @OptIn(InternalCoroutinesApi::class)
+    private suspend inline fun initComponents(
       appComponent: AppComponent,
       app: App,
-      initializeServer: (NettyApplicationEngine) -> Unit = {},
-    ) = supervisorScope {
+    ): CoroutineScope {
+      val newContext =
+        coroutineContext.newCoroutineContext(Dispatchers.Default + SupervisorJob() + CoroutineName("mainJobScope"))
+      val scope = CoroutineScope(newContext)
+
+      // Start EventCenter
+      EventCenter.start()
+
       val appConfigRepository = appComponent.getAppConfigRepository()
       val downloadService = appComponent.getDownloadService()
       val uploadService = appComponent.getUploadService()
 
-      // await for app config to be loaded
-      withContext(Dispatchers.IO) {
+      scope.apply {
+        // await for app config to be loaded
         initAppConfig(appConfigRepository, app)
-      }
-      // launch a job to listen for app config changes
-      launch(Dispatchers.IO) {
-        appConfigRepository.streamAppConfig()
-          .collect {
-            app.updateConfig(it)
-            // TODO : find a way to update download semaphore dynamically
+        // launch a job to listen for app config changes
+        launch {
+          appConfigRepository.streamAppConfig()
+            .flowOn(Dispatchers.IO)
+            .collect {
+              app.updateConfig(it)
+              // TODO : find a way to update download semaphore dynamically
+            }
+        }
+        // start download
+        launch {
+          downloadService.run(scope)
+        }
+
+        val downloadStateEventPlugin = appComponent.getDownloadStateEventPlugin()
+
+        // start the backend server
+        launch(CoroutineName("serverScope")) {
+          val serverConfig = ServerConfig(
+            port = 12555,
+            host = "0.0.0.0",
+            parentContext = scope.coroutineContext,
+            json = appComponent.getJson(),
+            userRepo = appComponent.getUserRepo(),
+            appConfigRepo = appComponent.getAppConfigRepository(),
+            streamerRepo = appComponent.getStreamerRepo(),
+            streamDataRepo = appComponent.getStreamDataRepo(),
+            statsRepo = appComponent.getStatsRepository(),
+            uploadRepo = appComponent.getUploadRepo(),
+            extractorFactory = appComponent.getExtractorFactory(),
+            engineConfigRepo = appComponent.getEngineConfigRepository(),
+            downloadStateEventPlugin = downloadStateEventPlugin,
+          )
+
+          server = backendServer(serverConfig).apply {
+            start()
           }
-      }
-      // start download and upload services
-      launch {
-        downloadService.run()
-      }
-      // start a job to listen for events
-      launch {
-        EventCenter.run()
-      }
-      // start the backend server
-      launch {
-        val server = backendServer(
-          json = appComponent.getJson(),
-          appComponent.getUserRepo(),
-          appComponent.getAppConfigRepository(),
-          appComponent.getStreamerRepo(),
-          appComponent.getStreamDataRepo(),
-          appComponent.getStatsRepository(),
-          appComponent.getUploadRepo(),
-        ).apply {
-          start()
-          initializeServer(this)
         }
       }
-      coroutineContext[Job]!!.join()
+      return scope
     }
 
+    private val LOG_LEVEL
+      get() = System.getenv("LOG_LEVEL")?.nonEmptyOrNull().let { Level.valueOf(it) } ?: Level.INFO
+
     private fun initLogger() {
+      val logLevel = LOG_LEVEL
       val loggerContext = LoggerFactory.getILoggerFactory() as LoggerContext
       loggerContext.reset()
 
       val patternEncoder = PatternLayoutEncoder().apply {
         context = loggerContext
-        pattern = "%d{YYYY-MM-dd HH:mm:ss.SSS} [%thread] %-5level %logger{36} - %msg%n"
+        pattern = "%d{MM-dd HH:mm:ss.SSS} [%thread] %-5level %logger{36} - %msg%n"
         start()
       }
 
@@ -145,8 +181,7 @@ class Application {
         name = "STDOUT"
         encoder = patternEncoder
         addFilter(LevelFilter().apply {
-          val level = System.getenv("LOG_LEVEL")?.let { Level.valueOf(it) } ?: Level.INFO
-          setLevel(level)
+          setLevel(logLevel)
           onMatch = FilterReply.ACCEPT
           onMismatch = FilterReply.DENY
         })
@@ -176,7 +211,7 @@ class Application {
           it.start()
         }
         addFilter(LevelFilter().apply {
-          setLevel(Level.DEBUG)
+          setLevel(logLevel)
           onMatch = FilterReply.ACCEPT
           onMismatch = FilterReply.DENY
         })
@@ -186,22 +221,14 @@ class Application {
       loggerContext.getLogger(Logger.ROOT_LOGGER_NAME).apply {
         addAppender(consoleAppender)
         addAppender(fileAppender)
-        level = Level.DEBUG
+        level = logLevel
       }
     }
 
-    private suspend fun initAppConfig(repo: AppConfigRepo, app: App): AppConfig {
-      return repo.getAppConfig().also {
+    private suspend fun initAppConfig(repo: AppConfigRepo, app: App): AppConfig = withIOContext {
+      repo.getAppConfig().also {
         app.updateConfig(it)
         // TODO : find a way to update download semaphore dynamically
-      }
-    }
-
-    private fun SqlDriver.closeDriver() {
-      try {
-        close()
-      } catch (e: IOException) {
-        logger.error("Error closing sql driver", e)
       }
     }
   }

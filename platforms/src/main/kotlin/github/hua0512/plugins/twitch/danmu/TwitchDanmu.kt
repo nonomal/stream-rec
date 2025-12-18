@@ -34,8 +34,7 @@ import github.hua0512.plugins.danmu.base.Danmu
 import github.hua0512.plugins.twitch.download.TwitchExtractor
 import io.ktor.http.*
 import io.ktor.websocket.*
-import kotlinx.datetime.Clock
-import kotlinx.datetime.Instant
+import kotlin.time.Instant
 
 /**
  * Twitch chat comments download implementation
@@ -72,6 +71,10 @@ class TwitchDanmu(app: App) : Danmu(app = app, enablePing = false) {
 
   override fun oneHello(): ByteArray = throw UnsupportedOperationException("TwitchDanmu does not support oneHello")
 
+  override fun onDanmuRetry(retryCount: Int) {
+    // do nothing
+  }
+
   override suspend fun sendHello(session: WebSocketSession) {
     val user = "justinfan${(1000..99999).random()}"
     with(session) {
@@ -91,6 +94,7 @@ class TwitchDanmu(app: App) : Danmu(app = app, enablePing = false) {
   private val namePattern = Regex("display-name=([^;]+);")
   private val colorPattern = Regex("color=#([a-zA-Z0-9]{6});")
   private val timePattern = Regex("tmi-sent-ts=(\\d+);")
+  private val userIdPattern = Regex("user-id=(\\d+);")
 
   override suspend fun decodeDanmu(session: WebSocketSession, data: ByteArray): List<DanmuDataWrapper?> {
     val message = data.decodeToString()
@@ -108,10 +112,11 @@ class TwitchDanmu(app: App) : Danmu(app = app, enablePing = false) {
     val content = contentPattern.find(message)?.groupValues?.get(1) ?: return emptyList()
     val name = namePattern.find(message)?.groupValues?.get(1) ?: ""
     val color = colorPattern.find(message)?.groupValues?.get(1)
-    val time = timePattern.find(message)?.groupValues?.get(1) ?: Clock.System.now().toEpochMilliseconds().toString()
-
+    val time = timePattern.find(message)?.groupValues?.get(1) ?: kotlin.time.Clock.System.now().toEpochMilliseconds().toString()
+    val userId = userIdPattern.find(message)?.groupValues?.get(1)?.toLong() ?: 0L
     return listOf(
       DanmuData(
+        uid = userId,
         sender = name,
         color = color?.toInt(16) ?: 0,
         content = content,

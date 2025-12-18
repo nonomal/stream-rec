@@ -27,19 +27,30 @@
 package github.hua0512.repo
 
 import github.hua0512.data.config.AppConfig
+import github.hua0512.utils.mainLogger
+import github.hua0512.utils.generateRandomString
 import kotlinx.coroutines.flow.Flow
 import java.nio.file.Files
+import java.nio.file.StandardOpenOption
 import kotlin.io.path.Path
-import kotlin.io.path.createParentDirectories
 import kotlin.io.path.pathString
 
 /**
+ * Local data source
  * @author hua0512
  * @date : 2024/2/18 23:50
  */
 interface LocalDataSource {
 
   companion object {
+
+    const val DEFAULT_PASSWORD_COST = 12
+
+    const val DEFAULT_USER = "stream-rec"
+    const val DEFAULT_PASSWORD = DEFAULT_USER
+    const val DEFAULT_ROLE = "ADMIN"
+
+
     fun getDefaultPath(): String {
       val envPath = System.getenv("DB_PATH") ?: System.getProperty("user.dir")
       val path = Path(envPath, "db").resolve("stream-rec.db")
@@ -47,8 +58,22 @@ interface LocalDataSource {
     }
 
     fun getJwtSecret(): String {
-      val envKey = System.getenv("JWT_SECRET")
-      return envKey ?: "n6hCG9eSwj6foa3MhubtBBJbF1rxYt2rUlC2jOllrg1zquvmU9Fg6auCDfZy3l83"
+      val config = Path(getDefaultPath()).resolveSibling("config.conf").also {
+        if (!Files.exists(it)) {
+          // create config file
+          Files.createFile(it)
+        }
+      }
+      val configContent = Files.readAllLines(config)
+      return configContent.find { it.startsWith("jwt.secret") }?.split("=")?.get(1)?.trim().run {
+        if (isNullOrBlank()) {
+          val generated = generateRandomString(32, true)
+          mainLogger.info("First run, generate jwt secret $generated")
+          // append jwt secret to end of file
+          Files.writeString(config, "\njwt.secret = $generated", Charsets.UTF_8, StandardOpenOption.APPEND)
+          generated
+        } else return this
+      }
     }
 
     fun isFirstRun(): Boolean {
@@ -56,25 +81,6 @@ interface LocalDataSource {
       return !Files.exists(Path(dbPath))
     }
 
-    private fun getDbVersionPath(): String {
-      // get db version from file
-      val dbPath = getDefaultPath()
-      return Path(dbPath).resolveSibling("version").pathString
-    }
-
-    fun getDbVersion(): Long {
-      val dbVersionPath = Path(getDbVersionPath())
-      // check if db version file exists
-      if (!Files.exists(dbVersionPath)) return 0
-      return Files.readString(dbVersionPath, Charsets.UTF_8).toLongOrNull() ?: 0
-    }
-
-    fun writeDbVersion(version: Long) {
-      val dbVersionPath = Path(getDbVersionPath())
-      dbVersionPath.createParentDirectories()
-      // overwrite db version file
-      Files.writeString(dbVersionPath, version.toString(), Charsets.UTF_8)
-    }
   }
 
   suspend fun streamAppConfig(): Flow<AppConfig>

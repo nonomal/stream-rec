@@ -3,7 +3,7 @@
  *
  * Stream-rec  https://github.com/hua0512/stream-rec
  *
- * Copyright (c) 2024 hua0512 (https://github.com/hua0512)
+ * Copyright (c) 2025 hua0512 (https://github.com/hua0512)
  *
  * Permission is hereby granted, free of charge, to any person obtaining a copy
  * of this software and associated documentation files (the "Software"), to deal
@@ -27,6 +27,9 @@
 package github.hua0512.data.dto
 
 import github.hua0512.data.config.DownloadConfig
+import github.hua0512.data.config.engine.DownloadEngines
+import github.hua0512.data.config.engine.EngineConfig
+import github.hua0512.data.stream.StreamerState
 import github.hua0512.data.stream.StreamingPlatform
 
 /**
@@ -37,13 +40,15 @@ interface StreamerDTO {
   val name: String
   val url: String
   val platform: StreamingPlatform
-  var lastLiveTime: Long?
-  var isLive: Boolean
-  var isActivated: Boolean
-  var avatar: String?
-  var streamTitle: String?
-  val templateStreamer: StreamerDTO?
+  val lastLiveTime: Long
+  val state: StreamerState
+  val avatar: String?
+  val streamTitle: String?
   val downloadConfig: DownloadConfig?
   val isTemplate: Boolean
   val templateId: Long?
+  val startTime: String?
+  val endTime: String?
+  val engine: DownloadEngines?
+  val engineConfig: EngineConfig?
 }
